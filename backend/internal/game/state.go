@@ -7,6 +7,9 @@ import (
 )
 
 var ErrInvalidGameSetup = errors.New("invalid game setup")
+var ErrInvalidGamePhase = errors.New("invalid game phase")
+var ErrNotPlayerTurn = errors.New("not player turn")
+var ErrInvalidBid = errors.New("invalid bid")
 
 type GamePhase string
 
@@ -81,6 +84,7 @@ type BiddingState struct {
 	HighestBidSeatIndex int
 	Bids                []Bid
 	Rounds              int
+	RedealCount         int
 }
 
 // Game 表示一局斗地主的完整领域状态。
@@ -116,6 +120,11 @@ func NewGame(gameID string, players []GamePlayerInput, rng RNG) (*Game, error) {
 		StartedAt:         time.Now().UTC(),
 	}
 
+	startSeat := 0
+	if rng != nil {
+		startSeat = rng.Intn(PlayerCount)
+	}
+
 	// 先构造玩家骨架，保证发牌后手牌按 seat_index 稳定落位。
 	game.Players = make([]PlayerState, PlayerCount)
 	for _, input := range players {
@@ -143,11 +152,6 @@ func NewGame(gameID string, players []GamePlayerInput, rng RNG) (*Game, error) {
 		game.Players[seatIndex].RemainingCount = len(hands[seatIndex])
 	}
 
-	startSeat := 0
-	if rng != nil {
-		startSeat = rng.Intn(PlayerCount)
-	}
-
 	game.Phase = GamePhaseBidding
 	game.CurrentSeatIndex = startSeat
 	game.BiddingState = BiddingState{
@@ -157,9 +161,146 @@ func NewGame(gameID string, players []GamePlayerInput, rng RNG) (*Game, error) {
 		HighestBidSeatIndex: -1,
 		Bids:                nil,
 		Rounds:              0,
+		RedealCount:         0,
 	}
 
 	return game, nil
+}
+
+// PlaceBid 处理叫分动作，并在条件满足时推进到地主确定或重发牌。
+func (g *Game) PlaceBid(seatIndex int, score int, rng RNG) error {
+	if g.Phase != GamePhaseBidding {
+		return ErrInvalidGamePhase
+	}
+	if seatIndex != g.BiddingState.CurrentSeatIndex || seatIndex != g.CurrentSeatIndex {
+		return ErrNotPlayerTurn
+	}
+	if score < 0 || score > 3 {
+		return ErrInvalidBid
+	}
+	if score != 0 && score <= g.BiddingState.HighestBid {
+		return ErrInvalidBid
+	}
+
+	player := &g.Players[seatIndex]
+	bid := Bid{
+		SeatIndex: seatIndex,
+		UserID:    player.UserID,
+		Score:     score,
+		CreatedAt: time.Now().UTC(),
+	}
+
+	g.BiddingState.Bids = append(g.BiddingState.Bids, bid)
+	g.BiddingState.Rounds++
+	player.BidScore = score
+
+	if score > g.BiddingState.HighestBid {
+		g.BiddingState.HighestBid = score
+		g.BiddingState.HighestBidSeatIndex = seatIndex
+	}
+
+	if score == 3 {
+		g.assignLandlord(seatIndex)
+		return nil
+	}
+
+	if len(g.BiddingState.Bids) >= PlayerCount {
+		if g.BiddingState.HighestBid > 0 {
+			g.assignLandlord(g.BiddingState.HighestBidSeatIndex)
+			return nil
+		}
+		return g.handleAllPass(rng)
+	}
+
+	nextSeat := (seatIndex + 1) % PlayerCount
+	g.BiddingState.CurrentSeatIndex = nextSeat
+	g.CurrentSeatIndex = nextSeat
+	return nil
+}
+
+// assignLandlord 在叫分结束后设置地主、分配底牌并切到出牌阶段。
+func (g *Game) assignLandlord(seatIndex int) {
+	g.LandlordSeatIndex = seatIndex
+	g.CurrentSeatIndex = seatIndex
+	g.BiddingState.CurrentSeatIndex = seatIndex
+	g.Phase = GamePhasePlaying
+	if g.BiddingState.HighestBid > 0 {
+		g.Multiplier = g.BiddingState.HighestBid
+	} else {
+		g.Multiplier = 1
+	}
+
+	for i := range g.Players {
+		g.Players[i].Role = RoleFarmer
+	}
+
+	landlord := &g.Players[seatIndex]
+	landlord.Role = RoleLandlord
+	landlord.Hand = append(landlord.Hand, g.BottomCards...)
+	landlord.RemainingCount = len(landlord.Hand)
+
+	for i := range g.Players {
+		if i == seatIndex {
+			continue
+		}
+		g.Players[i].RemainingCount = len(g.Players[i].Hand)
+	}
+}
+
+// handleAllPass 处理三人都不叫的场景：先重发一次，再次全不叫则随机指定地主。
+func (g *Game) handleAllPass(rng RNG) error {
+	if g.BiddingState.RedealCount == 0 {
+		return g.redealForAllPass(rng)
+	}
+
+	seatIndex := 0
+	if rng != nil {
+		seatIndex = rng.Intn(PlayerCount)
+	}
+	g.BiddingState.HighestBid = 1
+	g.BiddingState.HighestBidSeatIndex = seatIndex
+	g.Players[seatIndex].BidScore = 1
+	g.assignLandlord(seatIndex)
+	return nil
+}
+
+// redealForAllPass 在首次全部不叫时重新洗牌发牌，并重置叫分状态。
+func (g *Game) redealForAllPass(rng RNG) error {
+	startSeat := 0
+	if rng != nil {
+		startSeat = rng.Intn(PlayerCount)
+	}
+
+	deck := Shuffle(NewDeck(), rng)
+	hands, bottom, err := Deal(deck)
+	if err != nil {
+		return err
+	}
+
+	g.Deck = deck
+	g.BottomCards = bottom
+	for seatIndex := range g.Players {
+		g.Players[seatIndex].Hand = hands[seatIndex]
+		g.Players[seatIndex].RemainingCount = len(hands[seatIndex])
+		g.Players[seatIndex].BidScore = 0
+		g.Players[seatIndex].Role = RoleNone
+	}
+
+	g.Phase = GamePhaseBidding
+	g.CurrentSeatIndex = startSeat
+	g.LandlordSeatIndex = -1
+	g.Multiplier = 1
+	g.BiddingState = BiddingState{
+		StartSeatIndex:      startSeat,
+		CurrentSeatIndex:    startSeat,
+		HighestBid:          0,
+		HighestBidSeatIndex: -1,
+		Bids:                nil,
+		Rounds:              0,
+		RedealCount:         1,
+	}
+
+	return nil
 }
 
 func validateGameSetup(gameID string, players []GamePlayerInput) error {

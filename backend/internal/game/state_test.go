@@ -2,12 +2,11 @@ package game
 
 import (
 	"errors"
-	"math/rand"
 	"testing"
 )
 
 func TestNewGameInitializesState(t *testing.T) {
-	rng := rand.New(rand.NewSource(7))
+	rng := &fixedRNG{values: []int{1}}
 	game, err := NewGame("g_001", defaultPlayers(), rng)
 	if err != nil {
 		t.Fatalf("NewGame() error = %v", err)
@@ -39,6 +38,9 @@ func TestNewGameInitializesState(t *testing.T) {
 	}
 	if game.BiddingState.HighestBidSeatIndex != -1 {
 		t.Fatalf("highest bid seat = %d, want -1", game.BiddingState.HighestBidSeatIndex)
+	}
+	if game.BiddingState.RedealCount != 0 {
+		t.Fatalf("redeal count = %d, want 0", game.BiddingState.RedealCount)
 	}
 	if game.LandlordSeatIndex != -1 {
 		t.Fatalf("landlord seat = %d, want -1", game.LandlordSeatIndex)
@@ -138,11 +140,146 @@ func TestNewGameRejectsInvalidSetup(t *testing.T) {
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewGame(tc.gameID, tc.players, rand.New(rand.NewSource(1)))
+			_, err := NewGame(tc.gameID, tc.players, &fixedRNG{values: []int{0}})
 			if !errors.Is(err, ErrInvalidGameSetup) {
 				t.Fatalf("NewGame() error = %v, want ErrInvalidGameSetup", err)
 			}
 		})
+	}
+}
+
+func TestPlaceBidRejectsOutOfTurn(t *testing.T) {
+	game, _ := newBiddingGame(t, []int{0})
+
+	err := game.PlaceBid(1, 1, &fixedRNG{values: []int{0}})
+	if !errors.Is(err, ErrNotPlayerTurn) {
+		t.Fatalf("PlaceBid() error = %v, want ErrNotPlayerTurn", err)
+	}
+}
+
+func TestPlaceBidRejectsLowerOrEqualHighestBid(t *testing.T) {
+	game, _ := newBiddingGame(t, []int{0})
+
+	if err := game.PlaceBid(0, 1, &fixedRNG{values: []int{0}}); err != nil {
+		t.Fatalf("first PlaceBid() error = %v", err)
+	}
+	err := game.PlaceBid(1, 1, &fixedRNG{values: []int{0}})
+	if !errors.Is(err, ErrInvalidBid) {
+		t.Fatalf("second PlaceBid() error = %v, want ErrInvalidBid", err)
+	}
+}
+
+func TestPlaceBidThreeImmediatelyAssignsLandlord(t *testing.T) {
+	game, _ := newBiddingGame(t, []int{0})
+
+	if err := game.PlaceBid(0, 3, &fixedRNG{values: []int{0}}); err != nil {
+		t.Fatalf("PlaceBid() error = %v", err)
+	}
+
+	if game.Phase != GamePhasePlaying {
+		t.Fatalf("phase = %q, want %q", game.Phase, GamePhasePlaying)
+	}
+	if game.LandlordSeatIndex != 0 {
+		t.Fatalf("landlord seat = %d, want 0", game.LandlordSeatIndex)
+	}
+	if game.CurrentSeatIndex != 0 {
+		t.Fatalf("current seat = %d, want 0", game.CurrentSeatIndex)
+	}
+	if game.Multiplier != 3 {
+		t.Fatalf("multiplier = %d, want 3", game.Multiplier)
+	}
+	if game.Players[0].Role != RoleLandlord {
+		t.Fatalf("player[0].role = %q, want %q", game.Players[0].Role, RoleLandlord)
+	}
+	if len(game.Players[0].Hand) != 20 {
+		t.Fatalf("len(player[0].Hand) = %d, want 20", len(game.Players[0].Hand))
+	}
+	for i := 1; i < PlayerCount; i++ {
+		if game.Players[i].Role != RoleFarmer {
+			t.Fatalf("player[%d].role = %q, want %q", i, game.Players[i].Role, RoleFarmer)
+		}
+	}
+}
+
+func TestPlaceBidAllPassRedealsOnce(t *testing.T) {
+	game, rng := newBiddingGame(t, []int{0, 1})
+
+	if err := game.PlaceBid(0, 0, rng); err != nil {
+		t.Fatalf("PlaceBid 1 error = %v", err)
+	}
+	if err := game.PlaceBid(1, 0, rng); err != nil {
+		t.Fatalf("PlaceBid 2 error = %v", err)
+	}
+	if err := game.PlaceBid(2, 0, rng); err != nil {
+		t.Fatalf("PlaceBid 3 error = %v", err)
+	}
+
+	if game.Phase != GamePhaseBidding {
+		t.Fatalf("phase = %q, want %q", game.Phase, GamePhaseBidding)
+	}
+	if game.BiddingState.RedealCount != 1 {
+		t.Fatalf("redeal count = %d, want 1", game.BiddingState.RedealCount)
+	}
+	if game.BiddingState.HighestBid != 0 || game.BiddingState.HighestBidSeatIndex != -1 {
+		t.Fatalf("highest bid state not reset: %+v", game.BiddingState)
+	}
+	if len(game.BiddingState.Bids) != 0 {
+		t.Fatalf("bids len = %d, want 0", len(game.BiddingState.Bids))
+	}
+	if game.CurrentSeatIndex < 0 || game.CurrentSeatIndex >= PlayerCount {
+		t.Fatalf("current seat = %d, want within [0,%d)", game.CurrentSeatIndex, PlayerCount)
+	}
+	for i := range game.Players {
+		if len(game.Players[i].Hand) != HandCardCount {
+			t.Fatalf("len(player[%d].Hand) = %d, want %d", i, len(game.Players[i].Hand), HandCardCount)
+		}
+		if game.Players[i].BidScore != 0 {
+			t.Fatalf("player[%d].BidScore = %d, want 0", i, game.Players[i].BidScore)
+		}
+	}
+}
+
+func TestPlaceBidSecondAllPassAssignsRandomLandlord(t *testing.T) {
+	game, rng := newBiddingGame(t, []int{0, 1, 2})
+
+	if err := game.PlaceBid(0, 0, rng); err != nil {
+		t.Fatalf("round1 bid1 error = %v", err)
+	}
+	if err := game.PlaceBid(1, 0, rng); err != nil {
+		t.Fatalf("round1 bid2 error = %v", err)
+	}
+	if err := game.PlaceBid(2, 0, rng); err != nil {
+		t.Fatalf("round1 bid3 error = %v", err)
+	}
+
+	startSeat := game.CurrentSeatIndex
+	secondSeat := (startSeat + 1) % PlayerCount
+	thirdSeat := (startSeat + 2) % PlayerCount
+
+	if err := game.PlaceBid(startSeat, 0, rng); err != nil {
+		t.Fatalf("round2 bid1 error = %v", err)
+	}
+	if err := game.PlaceBid(secondSeat, 0, rng); err != nil {
+		t.Fatalf("round2 bid2 error = %v", err)
+	}
+	if err := game.PlaceBid(thirdSeat, 0, rng); err != nil {
+		t.Fatalf("round2 bid3 error = %v", err)
+	}
+
+	if game.Phase != GamePhasePlaying {
+		t.Fatalf("phase = %q, want %q", game.Phase, GamePhasePlaying)
+	}
+	if game.LandlordSeatIndex < 0 || game.LandlordSeatIndex >= PlayerCount {
+		t.Fatalf("landlord seat = %d, want within [0,%d)", game.LandlordSeatIndex, PlayerCount)
+	}
+	if game.Multiplier != 1 {
+		t.Fatalf("multiplier = %d, want 1", game.Multiplier)
+	}
+	if len(game.Players[game.LandlordSeatIndex].Hand) != 20 {
+		t.Fatalf("len(player[%d].Hand) = %d, want 20", game.LandlordSeatIndex, len(game.Players[game.LandlordSeatIndex].Hand))
+	}
+	if game.Players[game.LandlordSeatIndex].Role != RoleLandlord {
+		t.Fatalf("landlord role = %q, want %q", game.Players[game.LandlordSeatIndex].Role, RoleLandlord)
 	}
 }
 
@@ -152,4 +289,38 @@ func defaultPlayers() []GamePlayerInput {
 		{UserID: "u2", SeatIndex: 1},
 		{UserID: "u3", SeatIndex: 2},
 	}
+}
+
+func newBiddingGame(t *testing.T, rngValues []int) (*Game, *fixedRNG) {
+	t.Helper()
+	rng := &fixedRNG{values: rngValues}
+	game, err := NewGame("g_001", defaultPlayers(), rng)
+	if err != nil {
+		t.Fatalf("NewGame() error = %v", err)
+	}
+	return game, rng
+}
+
+type fixedRNG struct {
+	values []int
+	index  int
+}
+
+func (r *fixedRNG) Intn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n != PlayerCount {
+		return 0
+	}
+	if len(r.values) == 0 {
+		return 0
+	}
+	value := r.values[r.index%len(r.values)]
+	r.index++
+	value %= n
+	if value < 0 {
+		value += n
+	}
+	return value
 }

@@ -283,11 +283,165 @@ func TestPlaceBidSecondAllPassAssignsRandomLandlord(t *testing.T) {
 	}
 }
 
+func TestPlayCardsRejectsOutOfTurn(t *testing.T) {
+	game := newManualPlayingGame()
+
+	err := game.PlayCards(1, mustCardsForGame([]string{"S4"}))
+	if !errors.Is(err, ErrNotPlayerTurn) {
+		t.Fatalf("PlayCards() error = %v, want ErrNotPlayerTurn", err)
+	}
+}
+
+func TestPlayCardsRejectsCardsNotInHand(t *testing.T) {
+	game := newManualPlayingGame()
+
+	err := game.PlayCards(0, mustCardsForGame([]string{"RJ"}))
+	if !errors.Is(err, ErrInvalidCardSet) {
+		t.Fatalf("PlayCards() error = %v, want ErrInvalidCardSet", err)
+	}
+}
+
+func TestPassRejectsOnFreshTrick(t *testing.T) {
+	game := newManualPlayingGame()
+
+	err := game.Pass(0)
+	if !errors.Is(err, ErrCannotPass) {
+		t.Fatalf("Pass() error = %v, want ErrCannotPass", err)
+	}
+}
+
+func TestPlayCardsRemovesCardsAndAdvancesTurn(t *testing.T) {
+	game := newManualPlayingGame()
+
+	if err := game.PlayCards(0, mustCardsForGame([]string{"S3"})); err != nil {
+		t.Fatalf("PlayCards() error = %v", err)
+	}
+
+	if game.CurrentSeatIndex != 1 {
+		t.Fatalf("current seat = %d, want 1", game.CurrentSeatIndex)
+	}
+	if game.PassCount != 0 {
+		t.Fatalf("pass count = %d, want 0", game.PassCount)
+	}
+	if game.LastPlay == nil {
+		t.Fatal("last play should be set")
+	}
+	if len(game.Players[0].Hand) != 3 {
+		t.Fatalf("len(player[0].Hand) = %d, want 3", len(game.Players[0].Hand))
+	}
+	if game.Players[0].RemainingCount != 3 {
+		t.Fatalf("remaining count = %d, want 3", game.Players[0].RemainingCount)
+	}
+}
+
+func TestPlayCardsRequiresBeatingPreviousPlay(t *testing.T) {
+	game := newManualPlayingGame()
+	if err := game.PlayCards(0, mustCardsForGame([]string{"S3"})); err != nil {
+		t.Fatalf("lead PlayCards() error = %v", err)
+	}
+
+	err := game.PlayCards(1, mustCardsForGame([]string{"S4", "H4"}))
+	if !errors.Is(err, ErrInvalidCardSet) {
+		t.Fatalf("PlayCards() error = %v, want ErrInvalidCardSet", err)
+	}
+
+	if err := game.PlayCards(1, mustCardsForGame([]string{"S4"})); err != nil {
+		t.Fatalf("response PlayCards() error = %v", err)
+	}
+	if game.CurrentSeatIndex != 2 {
+		t.Fatalf("current seat = %d, want 2", game.CurrentSeatIndex)
+	}
+}
+
+func TestPassTwiceReturnsLeadToLastPlayer(t *testing.T) {
+	game := newManualPlayingGame()
+	if err := game.PlayCards(0, mustCardsForGame([]string{"S3"})); err != nil {
+		t.Fatalf("lead PlayCards() error = %v", err)
+	}
+
+	if err := game.Pass(1); err != nil {
+		t.Fatalf("first Pass() error = %v", err)
+	}
+	if game.CurrentSeatIndex != 2 {
+		t.Fatalf("current seat after first pass = %d, want 2", game.CurrentSeatIndex)
+	}
+	if err := game.Pass(2); err != nil {
+		t.Fatalf("second Pass() error = %v", err)
+	}
+
+	if game.CurrentSeatIndex != 0 {
+		t.Fatalf("current seat after second pass = %d, want 0", game.CurrentSeatIndex)
+	}
+	if game.LastPlay != nil {
+		t.Fatal("last play should be cleared after two passes")
+	}
+	if game.PassCount != 0 {
+		t.Fatalf("pass count = %d, want 0", game.PassCount)
+	}
+}
+
+func TestPlayCardsEndsGameOnEmptyHand(t *testing.T) {
+	game := newManualPlayingGame()
+	game.Players[0].Hand = mustCardsForGame([]string{"S3"})
+	game.Players[0].RemainingCount = 1
+
+	if err := game.PlayCards(0, mustCardsForGame([]string{"S3"})); err != nil {
+		t.Fatalf("PlayCards() error = %v", err)
+	}
+
+	if game.Phase != GamePhaseEnded {
+		t.Fatalf("phase = %q, want %q", game.Phase, GamePhaseEnded)
+	}
+	if game.EndedAt.IsZero() {
+		t.Fatal("ended_at should be set")
+	}
+	if game.Players[0].RemainingCount != 0 {
+		t.Fatalf("remaining count = %d, want 0", game.Players[0].RemainingCount)
+	}
+}
+
 func defaultPlayers() []GamePlayerInput {
 	return []GamePlayerInput{
 		{UserID: "u1", SeatIndex: 0},
 		{UserID: "u2", SeatIndex: 1},
 		{UserID: "u3", SeatIndex: 2},
+	}
+}
+
+func newManualPlayingGame() *Game {
+	return &Game{
+		ID:                "g_play",
+		Phase:             GamePhasePlaying,
+		LandlordSeatIndex: 0,
+		CurrentSeatIndex:  0,
+		BottomCards:       mustCardsForGame([]string{"S9", "H9", "D9"}),
+		Players: []PlayerState{
+			{
+				UserID:         "u1",
+				SeatIndex:      0,
+				Role:           RoleLandlord,
+				Status:         PlayerStatusPlaying,
+				Hand:           mustCardsForGame([]string{"S3", "H3", "D3", "S5"}),
+				RemainingCount: 4,
+			},
+			{
+				UserID:         "u2",
+				SeatIndex:      1,
+				Role:           RoleFarmer,
+				Status:         PlayerStatusPlaying,
+				Hand:           mustCardsForGame([]string{"S4", "H4", "D4", "S6"}),
+				RemainingCount: 4,
+			},
+			{
+				UserID:         "u3",
+				SeatIndex:      2,
+				Role:           RoleFarmer,
+				Status:         PlayerStatusPlaying,
+				Hand:           mustCardsForGame([]string{"S7", "H7", "D7", "S8"}),
+				RemainingCount: 4,
+			},
+		},
+		Multiplier: 1,
 	}
 }
 
@@ -323,4 +477,16 @@ func (r *fixedRNG) Intn(n int) int {
 		value += n
 	}
 	return value
+}
+
+func mustCardsForGame(codes []string) []Card {
+	cards := make([]Card, 0, len(codes))
+	for _, code := range codes {
+		card, err := ParseCard(code)
+		if err != nil {
+			panic(err)
+		}
+		cards = append(cards, card)
+	}
+	return cards
 }

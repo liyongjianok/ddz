@@ -10,6 +10,7 @@ var ErrInvalidGameSetup = errors.New("invalid game setup")
 var ErrInvalidGamePhase = errors.New("invalid game phase")
 var ErrNotPlayerTurn = errors.New("not player turn")
 var ErrInvalidBid = errors.New("invalid bid")
+var ErrCannotPass = errors.New("cannot pass")
 
 type GamePhase string
 
@@ -218,6 +219,83 @@ func (g *Game) PlaceBid(seatIndex int, score int, rng RNG) error {
 	return nil
 }
 
+// PlayCards 处理当前玩家的出牌动作，并在必要时推进到下一轮或结束游戏。
+func (g *Game) PlayCards(seatIndex int, cards []Card) error {
+	if g.Phase != GamePhasePlaying {
+		return ErrInvalidGamePhase
+	}
+	if seatIndex != g.CurrentSeatIndex {
+		return ErrNotPlayerTurn
+	}
+	if len(cards) == 0 {
+		return ErrInvalidCardSet
+	}
+
+	player := &g.Players[seatIndex]
+	if !ContainsCards(player.Hand, cards) {
+		return ErrInvalidCardSet
+	}
+
+	group, err := Recognize(cards)
+	if err != nil {
+		return err
+	}
+	if g.LastPlay != nil && !CanBeat(group, g.LastPlay.Group) {
+		return ErrInvalidCardSet
+	}
+
+	remaining, err := RemoveCards(player.Hand, cards)
+	if err != nil {
+		return err
+	}
+
+	player.Hand = remaining
+	player.RemainingCount = len(remaining)
+	g.LastPlay = &Play{
+		SeatIndex: seatIndex,
+		UserID:    player.UserID,
+		Cards:     copyCards(cards),
+		Group:     group,
+		CreatedAt: time.Now().UTC(),
+	}
+	g.PassCount = 0
+
+	if len(remaining) == 0 {
+		g.Phase = GamePhaseEnded
+		g.EndedAt = time.Now().UTC()
+		g.CurrentSeatIndex = seatIndex
+		return nil
+	}
+
+	g.CurrentSeatIndex = nextSeatIndex(seatIndex)
+	return nil
+}
+
+// Pass 处理“不出”动作；当连续两家不出时，上一手出牌者重新获得主动权。
+func (g *Game) Pass(seatIndex int) error {
+	if g.Phase != GamePhasePlaying {
+		return ErrInvalidGamePhase
+	}
+	if seatIndex != g.CurrentSeatIndex {
+		return ErrNotPlayerTurn
+	}
+	if g.LastPlay == nil {
+		return ErrCannotPass
+	}
+
+	g.PassCount++
+	if g.PassCount >= 2 {
+		leadSeat := g.LastPlay.SeatIndex
+		g.PassCount = 0
+		g.LastPlay = nil
+		g.CurrentSeatIndex = leadSeat
+		return nil
+	}
+
+	g.CurrentSeatIndex = nextSeatIndex(seatIndex)
+	return nil
+}
+
 // assignLandlord 在叫分结束后设置地主、分配底牌并切到出牌阶段。
 func (g *Game) assignLandlord(seatIndex int) {
 	g.LandlordSeatIndex = seatIndex
@@ -331,4 +409,8 @@ func validateGameSetup(gameID string, players []GamePlayerInput) error {
 	}
 
 	return nil
+}
+
+func nextSeatIndex(seatIndex int) int {
+	return (seatIndex + 1) % PlayerCount
 }

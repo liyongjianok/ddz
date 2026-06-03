@@ -9,6 +9,7 @@ Thumbs.db
 # Go
 backend/bin/
 backend/.cache/
+backend/.tmp/
 backend/coverage.out
 
 # Node

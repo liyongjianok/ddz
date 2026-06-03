@@ -101,6 +101,7 @@ type Game struct {
 	PassCount         int
 	BiddingState      BiddingState
 	Multiplier        int
+	Settlement        *SettlementResult
 	EventSeq          int
 	StartedAt         time.Time
 	EndedAt           time.Time

@@ -7,10 +7,10 @@
 已完成：
 
 - `T-0001 创建仓库结构`
+- `T-0002 后端配置和服务骨架`
 
 未实现：
 
-- 后端 HTTP 服务。
 - 认证。
 - 游戏规则。
 - 房间。
@@ -37,7 +37,17 @@ go test ./...
 go run ./cmd/server
 ```
 
-当前 `cmd/server` 仅为脚手架占位入口。真实 HTTP server 将在 `T-0002` 实现。
+默认监听地址为 `:8080`。可以通过环境变量覆盖：
+
+```bash
+APP_ENV=dev HTTP_ADDR=:18080 go run ./cmd/server
+```
+
+健康检查：
+
+```bash
+curl http://localhost:8080/healthz
+```
 
 ## 前端命令
 
@@ -59,4 +69,3 @@ npm run build
 - `docs/zh/07-ai-coding-rules.md`
 - `docs/zh/08-task-backlog.md`
 - 与当前任务相关的专题文档
-

@@ -43,6 +43,7 @@ type RoomSnapshotGame struct {
 	BottomCards       []string                `json:"bottom_cards,omitempty"`
 	LastPlay          *RoomSnapshotPlay       `json:"last_play,omitempty"`
 	Multiplier        int                     `json:"multiplier"`
+	DeadlineAt        time.Time               `json:"deadline_at,omitempty"`
 	Settlement        *RoomSnapshotSettlement `json:"settlement,omitempty"`
 }
 
@@ -185,6 +186,7 @@ func buildGameSnapshot(room *Room) (*RoomSnapshotGame, error) {
 		CurrentSeatIndex:  g.CurrentSeatIndex,
 		LandlordSeatIndex: g.LandlordSeatIndex,
 		Multiplier:        g.Multiplier,
+		DeadlineAt:        room.DeadlineAt,
 	}
 
 	if g.LandlordSeatIndex >= 0 {

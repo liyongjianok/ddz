@@ -15,6 +15,7 @@ var ErrRoomNotFound = errors.New("room not found")
 var ErrSeatUnavailable = errors.New("seat unavailable")
 var ErrRoomFull = errors.New("room full")
 var ErrUserAlreadyInActiveRoom = errors.New("user already in active room")
+var ErrGameNotStarted = errors.New("game not started")
 var ErrGameAlreadyStarted = errors.New("game already started")
 var ErrUserNotInRoom = errors.New("user not in room")
 
@@ -51,6 +52,26 @@ type ReadyInput struct {
 	Ready  bool
 }
 
+// BidInput 描述玩家叫分时所需的参数。
+type BidInput struct {
+	RoomID string
+	UserID string
+	Score  int
+}
+
+// PlayCardsInput 描述玩家出牌时所需的参数。
+type PlayCardsInput struct {
+	RoomID string
+	UserID string
+	Cards  []game.Card
+}
+
+// PassInput 描述玩家选择不出时所需的参数。
+type PassInput struct {
+	RoomID string
+	UserID string
+}
+
 // QuickStartInput 描述快速开始匹配所需的参数。
 type QuickStartInput struct {
 	UserID    string
@@ -76,6 +97,7 @@ type Room struct {
 	MaxPlayers  int
 	Seats       []Seat
 	CurrentGame *game.Game
+	DeadlineAt  time.Time
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -93,6 +115,7 @@ func (r *Room) Snapshot() Room {
 		MaxPlayers:  r.MaxPlayers,
 		Seats:       seats,
 		CurrentGame: r.CurrentGame,
+		DeadlineAt:  r.DeadlineAt,
 		CreatedAt:   r.CreatedAt,
 		UpdatedAt:   r.UpdatedAt,
 	}
@@ -323,6 +346,86 @@ func (m *Manager) Ready(input ReadyInput) (*Room, int, bool, error) {
 	}
 
 	return &room, seatIndex, started, nil
+}
+
+// Bid 通过房间 Actor 串行处理玩家叫分动作。
+func (m *Manager) Bid(input BidInput) (*Room, error) {
+	if input.RoomID == "" || input.UserID == "" {
+		return nil, ErrInvalidRoomConfig
+	}
+
+	m.mu.RLock()
+	actor, exists := m.rooms[input.RoomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, ErrRoomNotFound
+	}
+
+	room, err := actor.PlaceBid(input.UserID, input.Score)
+	if err != nil {
+		return nil, err
+	}
+	return &room, nil
+}
+
+// PlayCards 通过房间 Actor 串行处理玩家出牌动作。
+func (m *Manager) PlayCards(input PlayCardsInput) (*Room, error) {
+	if input.RoomID == "" || input.UserID == "" {
+		return nil, ErrInvalidRoomConfig
+	}
+
+	m.mu.RLock()
+	actor, exists := m.rooms[input.RoomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, ErrRoomNotFound
+	}
+
+	room, err := actor.PlayCards(input.UserID, input.Cards)
+	if err != nil {
+		return nil, err
+	}
+	return &room, nil
+}
+
+// Pass 通过房间 Actor 串行处理玩家不出动作。
+func (m *Manager) Pass(input PassInput) (*Room, error) {
+	if input.RoomID == "" || input.UserID == "" {
+		return nil, ErrInvalidRoomConfig
+	}
+
+	m.mu.RLock()
+	actor, exists := m.rooms[input.RoomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, ErrRoomNotFound
+	}
+
+	room, err := actor.Pass(input.UserID)
+	if err != nil {
+		return nil, err
+	}
+	return &room, nil
+}
+
+// HandleTimeout 将超时检查送入同一房间 Actor 队列处理。
+func (m *Manager) HandleTimeout(roomID string) (*Room, TimeoutAction, error) {
+	if roomID == "" {
+		return nil, TimeoutActionNone, ErrInvalidRoomConfig
+	}
+
+	m.mu.RLock()
+	actor, exists := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, TimeoutActionNone, ErrRoomNotFound
+	}
+
+	room, action, err := actor.HandleTimeout()
+	if err != nil {
+		return nil, TimeoutActionNone, err
+	}
+	return &room, action, nil
 }
 
 // GetRoom 返回房间当前快照。

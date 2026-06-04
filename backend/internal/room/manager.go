@@ -44,6 +44,13 @@ type JoinRoomInput struct {
 	PreferredSeat *int
 }
 
+// ReadyInput 描述玩家修改准备状态时所需的参数。
+type ReadyInput struct {
+	RoomID string
+	UserID string
+	Ready  bool
+}
+
 // QuickStartInput 描述快速开始匹配所需的参数。
 type QuickStartInput struct {
 	UserID    string
@@ -56,6 +63,7 @@ type Seat struct {
 	UserID    string
 	SeatIndex int
 	IsRobot   bool
+	Ready     bool
 	JoinedAt  time.Time
 }
 
@@ -93,16 +101,23 @@ func (r *Room) Snapshot() Room {
 // Manager 负责管理活跃房间及用户与房间的归属关系。
 type Manager struct {
 	mu       sync.RWMutex
-	rooms    map[string]*Room
+	rooms    map[string]*RoomActor
 	userRoom map[string]string
 	roomSeq  atomic.Uint64
+	rng      game.RNG
 }
 
 // NewManager 创建一个内存版房间管理器。
 func NewManager() *Manager {
+	return NewManagerWithRNG(nil)
+}
+
+// NewManagerWithRNG 创建一个可注入随机源的房间管理器。
+func NewManagerWithRNG(rng game.RNG) *Manager {
 	return &Manager{
-		rooms:    make(map[string]*Room),
+		rooms:    make(map[string]*RoomActor),
 		userRoom: make(map[string]string),
+		rng:      rng,
 	}
 }
 
@@ -116,9 +131,15 @@ func (m *Manager) CreateRoom(input CreateRoomInput) (*Room, int, error) {
 	defer m.mu.Unlock()
 
 	if roomID, exists := m.userRoom[input.UserID]; exists {
-		room := m.rooms[roomID]
-		if room != nil && room.Status != RoomStatusClosed {
-			return nil, -1, ErrUserAlreadyInActiveRoom
+		actor := m.rooms[roomID]
+		if actor != nil {
+			room, err := actor.Snapshot()
+			if err != nil {
+				return nil, -1, err
+			}
+			if room.Status != RoomStatusClosed {
+				return nil, -1, ErrUserAlreadyInActiveRoom
+			}
 		}
 		delete(m.userRoom, input.UserID)
 	}
@@ -144,10 +165,11 @@ func (m *Manager) CreateRoom(input CreateRoomInput) (*Room, int, error) {
 	room.Seats = append(room.Seats, Seat{
 		UserID:    input.UserID,
 		SeatIndex: seatIndex,
+		Ready:     false,
 		JoinedAt:  now,
 	})
 
-	m.rooms[room.ID] = room
+	m.rooms[room.ID] = NewRoomActor(room, m.rng)
 	m.userRoom[input.UserID] = room.ID
 
 	snapshot := room.Snapshot()
@@ -161,52 +183,40 @@ func (m *Manager) JoinRoom(input JoinRoomInput) (*Room, int, error) {
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if roomID, exists := m.userRoom[input.UserID]; exists {
 		if roomID == input.RoomID {
-			room := m.rooms[input.RoomID]
-			if room == nil {
+			actor := m.rooms[input.RoomID]
+			if actor == nil {
 				delete(m.userRoom, input.UserID)
+				m.mu.Unlock()
 				return nil, -1, ErrRoomNotFound
 			}
-			for _, seat := range room.Seats {
-				if seat.UserID == input.UserID {
-					snapshot := room.Snapshot()
-					return &snapshot, seat.SeatIndex, nil
-				}
+			room, seatIndex, _, err := actor.Join(input.UserID, input.PreferredSeat)
+			m.mu.Unlock()
+			if err != nil {
+				return nil, -1, err
 			}
+			return &room, seatIndex, nil
 		}
+		m.mu.Unlock()
 		return nil, -1, ErrUserAlreadyInActiveRoom
 	}
 
-	room, exists := m.rooms[input.RoomID]
+	actor, exists := m.rooms[input.RoomID]
 	if !exists {
+		m.mu.Unlock()
 		return nil, -1, ErrRoomNotFound
 	}
-	if room.Status != RoomStatusWaiting {
-		return nil, -1, ErrGameAlreadyStarted
-	}
-	if len(room.Seats) >= room.MaxPlayers {
-		return nil, -1, ErrRoomFull
-	}
 
-	seatIndex, err := firstAvailableSeat(room, input.PreferredSeat)
+	room, seatIndex, _, err := actor.Join(input.UserID, input.PreferredSeat)
 	if err != nil {
+		m.mu.Unlock()
 		return nil, -1, err
 	}
 
-	now := time.Now().UTC()
-	room.Seats = append(room.Seats, Seat{
-		UserID:    input.UserID,
-		SeatIndex: seatIndex,
-		JoinedAt:  now,
-	})
-	room.UpdatedAt = now
-	m.userRoom[input.UserID] = room.ID
-
-	snapshot := room.Snapshot()
-	return &snapshot, seatIndex, nil
+	m.userRoom[input.UserID] = input.RoomID
+	m.mu.Unlock()
+	return &room, seatIndex, nil
 }
 
 // LeaveRoom 允许用户离开等待房间；空房间会被关闭并从管理器移除。
@@ -216,40 +226,25 @@ func (m *Manager) LeaveRoom(roomID string, userID string) (*Room, error) {
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	room, exists := m.rooms[roomID]
+	actor, exists := m.rooms[roomID]
 	if !exists {
+		m.mu.Unlock()
 		return nil, ErrRoomNotFound
 	}
-	if room.Status != RoomStatusWaiting {
-		return nil, ErrGameAlreadyStarted
+
+	room, _, _, err := actor.Leave(userID)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
 	}
 
-	seatIndex := -1
-	for i, seat := range room.Seats {
-		if seat.UserID == userID {
-			seatIndex = i
-			break
-		}
-	}
-	if seatIndex < 0 {
-		return nil, ErrUserNotInRoom
-	}
-
-	room.Seats = append(room.Seats[:seatIndex], room.Seats[seatIndex+1:]...)
-	room.UpdatedAt = time.Now().UTC()
 	delete(m.userRoom, userID)
-
-	if len(room.Seats) == 0 {
-		room.Status = RoomStatusClosed
+	if room.Status == RoomStatusClosed {
 		delete(m.rooms, roomID)
-		snapshot := room.Snapshot()
-		return &snapshot, nil
 	}
+	m.mu.Unlock()
 
-	snapshot := room.Snapshot()
-	return &snapshot, nil
+	return &room, nil
 }
 
 // QuickStart 优先返回已有等待房间，否则创建新房间。
@@ -260,13 +255,15 @@ func (m *Manager) QuickStart(input QuickStartInput) (*Room, int, error) {
 
 	m.mu.Lock()
 	if roomID, exists := m.userRoom[input.UserID]; exists {
-		room := m.rooms[roomID]
-		if room != nil && room.Status != RoomStatusClosed {
-			for _, seat := range room.Seats {
-				if seat.UserID == input.UserID {
-					snapshot := room.Snapshot()
-					m.mu.Unlock()
-					return &snapshot, seat.SeatIndex, nil
+		actor := m.rooms[roomID]
+		if actor != nil {
+			room, err := actor.Snapshot()
+			if err == nil && room.Status != RoomStatusClosed {
+				for _, seat := range room.Seats {
+					if seat.UserID == input.UserID {
+						m.mu.Unlock()
+						return &room, seat.SeatIndex, nil
+					}
 				}
 			}
 		}
@@ -275,7 +272,11 @@ func (m *Manager) QuickStart(input QuickStartInput) (*Room, int, error) {
 
 	mode := normalizeMode(input.Mode)
 	baseScore := normalizeBaseScore(input.BaseScore)
-	for _, room := range m.rooms {
+	for roomID, actor := range m.rooms {
+		room, err := actor.Snapshot()
+		if err != nil {
+			continue
+		}
 		if room.Status != RoomStatusWaiting {
 			continue
 		}
@@ -286,22 +287,13 @@ func (m *Manager) QuickStart(input QuickStartInput) (*Room, int, error) {
 			continue
 		}
 
-		seatIndex, err := firstAvailableSeat(room, nil)
+		joinedRoom, seatIndex, _, err := actor.Join(input.UserID, nil)
 		if err != nil {
 			continue
 		}
-
-		now := time.Now().UTC()
-		room.Seats = append(room.Seats, Seat{
-			UserID:    input.UserID,
-			SeatIndex: seatIndex,
-			JoinedAt:  now,
-		})
-		room.UpdatedAt = now
-		m.userRoom[input.UserID] = room.ID
-		snapshot := room.Snapshot()
+		m.userRoom[input.UserID] = roomID
 		m.mu.Unlock()
-		return &snapshot, seatIndex, nil
+		return &joinedRoom, seatIndex, nil
 	}
 	m.mu.Unlock()
 
@@ -312,6 +304,27 @@ func (m *Manager) QuickStart(input QuickStartInput) (*Room, int, error) {
 	})
 }
 
+// Ready 修改等待房间中的玩家准备状态；房满且全员准备后自动开局。
+func (m *Manager) Ready(input ReadyInput) (*Room, int, bool, error) {
+	if input.RoomID == "" || input.UserID == "" {
+		return nil, -1, false, ErrInvalidRoomConfig
+	}
+
+	m.mu.RLock()
+	actor, exists := m.rooms[input.RoomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, -1, false, ErrRoomNotFound
+	}
+
+	room, seatIndex, started, err := actor.Ready(input.UserID, input.Ready)
+	if err != nil {
+		return nil, -1, false, err
+	}
+
+	return &room, seatIndex, started, nil
+}
+
 // GetRoom 返回房间当前快照。
 func (m *Manager) GetRoom(roomID string) (*Room, error) {
 	if roomID == "" {
@@ -319,15 +332,18 @@ func (m *Manager) GetRoom(roomID string) (*Room, error) {
 	}
 
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	room, exists := m.rooms[roomID]
+	actor, exists := m.rooms[roomID]
+	m.mu.RUnlock()
 	if !exists {
 		return nil, ErrRoomNotFound
 	}
 
-	snapshot := room.Snapshot()
-	return &snapshot, nil
+	room, err := actor.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+
+	return &room, nil
 }
 
 func (m *Manager) nextRoomID() string {

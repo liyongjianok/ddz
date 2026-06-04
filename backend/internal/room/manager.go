@@ -346,6 +346,22 @@ func (m *Manager) GetRoom(roomID string) (*Room, error) {
 	return &room, nil
 }
 
+// GetRoomSnapshot 返回指定玩家的专属房间快照。
+func (m *Manager) GetRoomSnapshot(roomID string, userID string) (*RoomSnapshot, error) {
+	if roomID == "" || userID == "" {
+		return nil, ErrInvalidRoomConfig
+	}
+
+	m.mu.RLock()
+	actor, exists := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, ErrRoomNotFound
+	}
+
+	return actor.BuildSnapshot(userID)
+}
+
 func (m *Manager) nextRoomID() string {
 	seq := m.roomSeq.Add(1)
 	return fmt.Sprintf("r_%06d", seq)

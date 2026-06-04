@@ -16,6 +16,7 @@ const (
 	roomCommandLeave    roomCommandType = "leave"
 	roomCommandReady    roomCommandType = "ready"
 	roomCommandSnapshot roomCommandType = "snapshot"
+	roomCommandView     roomCommandType = "view"
 )
 
 type roomCommand struct {
@@ -28,6 +29,7 @@ type roomCommand struct {
 
 type roomCommandResult struct {
 	room      Room
+	view      *RoomSnapshot
 	seatIndex int
 	started   bool
 	err       error
@@ -89,6 +91,18 @@ func (a *RoomActor) Snapshot() (Room, error) {
 	return reply.room, reply.err
 }
 
+// BuildSnapshot 生成指定玩家的专属房间快照。
+func (a *RoomActor) BuildSnapshot(userID string) (*RoomSnapshot, error) {
+	result := make(chan roomCommandResult, 1)
+	a.cmds <- roomCommand{
+		typ:      roomCommandView,
+		userID:   userID,
+		response: result,
+	}
+	reply := <-result
+	return reply.view, reply.err
+}
+
 func (a *RoomActor) call(cmd roomCommand) (Room, int, bool, error) {
 	result := make(chan roomCommandResult, 1)
 	cmd.response = result
@@ -109,6 +123,8 @@ func (a *RoomActor) loop() {
 			result.room, result.seatIndex, result.started, result.err = a.handleReady(cmd.userID, cmd.ready)
 		case roomCommandSnapshot:
 			result.room = a.room.Snapshot()
+		case roomCommandView:
+			result.view, result.err = BuildRoomSnapshot(a.room, cmd.userID)
 		default:
 			result.err = ErrInvalidRoomConfig
 		}

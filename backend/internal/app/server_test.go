@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"ddz/backend/internal/room"
 )
 
 type apiResponseEnvelope struct {
@@ -40,6 +42,32 @@ type currentUserData struct {
 		TotalGames  int `json:"total_games"`
 		Wins        int `json:"wins"`
 	} `json:"profile"`
+}
+
+type lobbySummaryData struct {
+	OnlinePlayers int `json:"online_players"`
+	ActiveRooms   int `json:"active_rooms"`
+	Modes         []struct {
+		Mode          string `json:"mode"`
+		BaseScore     int    `json:"base_score"`
+		OnlinePlayers int    `json:"online_players"`
+		WaitingRooms  int    `json:"waiting_rooms"`
+	} `json:"modes"`
+}
+
+type roomListData struct {
+	Items []struct {
+		RoomID      string    `json:"room_id"`
+		Mode        string    `json:"mode"`
+		Status      string    `json:"status"`
+		BaseScore   int       `json:"base_score"`
+		PlayerCount int       `json:"player_count"`
+		MaxPlayers  int       `json:"max_players"`
+		CreatedAt   time.Time `json:"created_at"`
+	} `json:"items"`
+	Page     int `json:"page"`
+	PageSize int `json:"page_size"`
+	Total    int `json:"total"`
 }
 
 func TestHealthzReturnsOK(t *testing.T) {
@@ -220,6 +248,108 @@ func TestCurrentUserRejectsMissingToken(t *testing.T) {
 	}
 }
 
+func TestLobbySummaryReturnsAggregatesWithValidToken(t *testing.T) {
+	manager := newLobbyTestManager(t)
+	handler := NewHTTPHandlerWithManager(testConfig(), manager)
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/lobby/summary", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Request-ID", "req_lobby_1")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var envelope apiResponseEnvelope
+	if err := json.NewDecoder(rec.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if envelope.Code != "ok" {
+		t.Fatalf("code = %q, want %q", envelope.Code, "ok")
+	}
+	if envelope.RequestID != "req_lobby_1" {
+		t.Fatalf("request id = %q, want %q", envelope.RequestID, "req_lobby_1")
+	}
+
+	var data lobbySummaryData
+	if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		t.Fatalf("decode data: %v", err)
+	}
+	if data.OnlinePlayers != 6 {
+		t.Fatalf("online players = %d, want 6", data.OnlinePlayers)
+	}
+	if data.ActiveRooms != 3 {
+		t.Fatalf("active rooms = %d, want 3", data.ActiveRooms)
+	}
+	if len(data.Modes) != 2 {
+		t.Fatalf("mode summary len = %d, want 2", len(data.Modes))
+	}
+}
+
+func TestRoomListReturnsPublicFieldsOnly(t *testing.T) {
+	manager := newLobbyTestManager(t)
+	handler := NewHTTPHandlerWithManager(testConfig(), manager)
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/rooms?mode=classic&status=waiting&page=1&page_size=20", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, `"hand"`) || strings.Contains(body, `"current_game"`) || strings.Contains(body, `"bottom_cards"`) {
+		t.Fatalf("room list leaked hidden game fields: %s", body)
+	}
+
+	var envelope apiResponseEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	var data roomListData
+	if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		t.Fatalf("decode data: %v", err)
+	}
+	if data.Total != 2 {
+		t.Fatalf("total = %d, want 2", data.Total)
+	}
+	if len(data.Items) != 2 {
+		t.Fatalf("item len = %d, want 2", len(data.Items))
+	}
+	for _, item := range data.Items {
+		if item.Mode != "classic" {
+			t.Fatalf("mode = %q, want %q", item.Mode, "classic")
+		}
+		if item.Status != "waiting" {
+			t.Fatalf("status = %q, want %q", item.Status, "waiting")
+		}
+	}
+}
+
+func TestRoomListRejectsInvalidQuery(t *testing.T) {
+	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManager())
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/rooms?page=0", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
 func loginAndGetToken(t *testing.T, handler http.Handler, payload string) string {
 	t.Helper()
 
@@ -251,4 +381,59 @@ func testConfig() Config {
 		JWTSecret:      "test-secret",
 		AccessTokenTTL: 24 * time.Hour,
 	}
+}
+
+func newLobbyTestManager(t *testing.T) *room.Manager {
+	t.Helper()
+
+	manager := room.NewManagerWithRNG(&fixedRoomRNG{value: 0})
+
+	roomA, _, err := manager.CreateRoom(room.CreateRoomInput{UserID: "u1", BaseScore: 1, Mode: "classic"})
+	if err != nil {
+		t.Fatalf("CreateRoom roomA error = %v", err)
+	}
+	if _, _, err := manager.JoinRoom(room.JoinRoomInput{RoomID: roomA.ID, UserID: "u2"}); err != nil {
+		t.Fatalf("JoinRoom roomA error = %v", err)
+	}
+
+	if _, _, err := manager.CreateRoom(room.CreateRoomInput{UserID: "u3", BaseScore: 1, Mode: "classic"}); err != nil {
+		t.Fatalf("CreateRoom roomB error = %v", err)
+	}
+
+	roomC, _, err := manager.CreateRoom(room.CreateRoomInput{UserID: "u4", BaseScore: 2, Mode: "classic"})
+	if err != nil {
+		t.Fatalf("CreateRoom roomC error = %v", err)
+	}
+	if _, _, err := manager.JoinRoom(room.JoinRoomInput{RoomID: roomC.ID, UserID: "u5"}); err != nil {
+		t.Fatalf("JoinRoom roomC u5 error = %v", err)
+	}
+	if _, _, err := manager.JoinRoom(room.JoinRoomInput{RoomID: roomC.ID, UserID: "u6"}); err != nil {
+		t.Fatalf("JoinRoom roomC u6 error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(room.ReadyInput{RoomID: roomC.ID, UserID: "u4", Ready: true}); err != nil {
+		t.Fatalf("Ready roomC u4 error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(room.ReadyInput{RoomID: roomC.ID, UserID: "u5", Ready: true}); err != nil {
+		t.Fatalf("Ready roomC u5 error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(room.ReadyInput{RoomID: roomC.ID, UserID: "u6", Ready: true}); err != nil {
+		t.Fatalf("Ready roomC u6 error = %v", err)
+	}
+
+	return manager
+}
+
+type fixedRoomRNG struct {
+	value int
+}
+
+func (r *fixedRoomRNG) Intn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	value := r.value % n
+	if value < 0 {
+		value += n
+	}
+	return value
 }

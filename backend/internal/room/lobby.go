@@ -139,7 +139,7 @@ func (m *Manager) ListRooms(filter RoomListFilter) (RoomListResult, error) {
 		if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
 			return items[i].CreatedAt.After(items[j].CreatedAt)
 		}
-		return items[i].RoomID < items[j].RoomID
+		return items[i].RoomID > items[j].RoomID
 	})
 
 	total := len(items)

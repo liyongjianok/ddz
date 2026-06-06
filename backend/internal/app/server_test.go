@@ -70,6 +70,17 @@ type roomListData struct {
 	Total    int `json:"total"`
 }
 
+type roomAccessData struct {
+	RoomID    string `json:"room_id"`
+	SeatIndex int    `json:"seat_index"`
+	WSURL     string `json:"ws_url"`
+}
+
+type leaveRoomData struct {
+	RoomID string `json:"room_id"`
+	Left   bool   `json:"left"`
+}
+
 func TestHealthzReturnsOK(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -350,6 +361,164 @@ func TestRoomListRejectsInvalidQuery(t *testing.T) {
 	}
 }
 
+func TestQuickStartReturnsRoomAndWSURL(t *testing.T) {
+	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManagerWithRNG(&fixedRoomRNG{value: 0}))
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	rec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/matchmaking/quick-start", token, `{"mode":"classic","base_score":1}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	envelope := decodeResponseEnvelope(t, rec)
+	if envelope.Code != "ok" {
+		t.Fatalf("code = %q, want %q", envelope.Code, "ok")
+	}
+
+	var data roomAccessData
+	decodeResponseData(t, envelope, &data)
+	if data.RoomID == "" {
+		t.Fatal("room_id should not be empty")
+	}
+	if data.SeatIndex != 0 {
+		t.Fatalf("seat_index = %d, want %d", data.SeatIndex, 0)
+	}
+	if data.WSURL != "/ws/v1/rooms/"+data.RoomID {
+		t.Fatalf("ws_url = %q, want %q", data.WSURL, "/ws/v1/rooms/"+data.RoomID)
+	}
+}
+
+func TestQuickStartReturnsExistingRoomForSameUser(t *testing.T) {
+	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManagerWithRNG(&fixedRoomRNG{value: 0}))
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	firstRec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/matchmaking/quick-start", token, `{"mode":"classic","base_score":1}`)
+	secondRec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/matchmaking/quick-start", token, `{"mode":"classic","base_score":1}`)
+
+	var firstData roomAccessData
+	decodeResponseData(t, decodeResponseEnvelope(t, firstRec), &firstData)
+
+	var secondData roomAccessData
+	decodeResponseData(t, decodeResponseEnvelope(t, secondRec), &secondData)
+
+	if secondData.RoomID != firstData.RoomID {
+		t.Fatalf("room_id = %q, want %q", secondData.RoomID, firstData.RoomID)
+	}
+	if secondData.SeatIndex != firstData.SeatIndex {
+		t.Fatalf("seat_index = %d, want %d", secondData.SeatIndex, firstData.SeatIndex)
+	}
+	if secondData.WSURL != firstData.WSURL {
+		t.Fatalf("ws_url = %q, want %q", secondData.WSURL, firstData.WSURL)
+	}
+}
+
+func TestCreateRoomReturnsRoomAndWSURL(t *testing.T) {
+	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManagerWithRNG(&fixedRoomRNG{value: 0}))
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	rec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms", token, `{"mode":"classic","base_score":2,"private":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var data roomAccessData
+	decodeResponseData(t, decodeResponseEnvelope(t, rec), &data)
+	if data.RoomID == "" {
+		t.Fatal("room_id should not be empty")
+	}
+	if data.SeatIndex != 0 {
+		t.Fatalf("seat_index = %d, want %d", data.SeatIndex, 0)
+	}
+	if data.WSURL != "/ws/v1/rooms/"+data.RoomID {
+		t.Fatalf("ws_url = %q, want %q", data.WSURL, "/ws/v1/rooms/"+data.RoomID)
+	}
+}
+
+func TestJoinRoomReturnsPreferredSeatAndWSURL(t *testing.T) {
+	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManagerWithRNG(&fixedRoomRNG{value: 0}))
+	hostToken := loginAndGetToken(t, handler, `{"display_name":"Host"}`)
+	guestToken := loginAndGetToken(t, handler, `{"display_name":"Guest"}`)
+
+	createRec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms", hostToken, `{"mode":"classic","base_score":1,"private":false}`)
+	var created roomAccessData
+	decodeResponseData(t, decodeResponseEnvelope(t, createRec), &created)
+
+	joinRec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms/"+created.RoomID+"/join", guestToken, `{"preferred_seat":2}`)
+	if joinRec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", joinRec.Code, http.StatusOK)
+	}
+
+	var joined roomAccessData
+	decodeResponseData(t, decodeResponseEnvelope(t, joinRec), &joined)
+	if joined.RoomID != created.RoomID {
+		t.Fatalf("room_id = %q, want %q", joined.RoomID, created.RoomID)
+	}
+	if joined.SeatIndex != 2 {
+		t.Fatalf("seat_index = %d, want %d", joined.SeatIndex, 2)
+	}
+	if joined.WSURL != "/ws/v1/rooms/"+created.RoomID {
+		t.Fatalf("ws_url = %q, want %q", joined.WSURL, "/ws/v1/rooms/"+created.RoomID)
+	}
+}
+
+func TestLeaveRoomReturnsLeftTrue(t *testing.T) {
+	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManagerWithRNG(&fixedRoomRNG{value: 0}))
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	createRec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms", token, `{"mode":"classic","base_score":1,"private":false}`)
+	var created roomAccessData
+	decodeResponseData(t, decodeResponseEnvelope(t, createRec), &created)
+
+	leaveRec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms/"+created.RoomID+"/leave", token, "")
+	if leaveRec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", leaveRec.Code, http.StatusOK)
+	}
+
+	var left leaveRoomData
+	decodeResponseData(t, decodeResponseEnvelope(t, leaveRec), &left)
+	if left.RoomID != created.RoomID {
+		t.Fatalf("room_id = %q, want %q", left.RoomID, created.RoomID)
+	}
+	if !left.Left {
+		t.Fatal("left should be true")
+	}
+}
+
+func TestJoinRoomRejectsRoomNotFound(t *testing.T) {
+	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManagerWithRNG(&fixedRoomRNG{value: 0}))
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	rec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms/r_missing/join", token, `{"preferred_seat":1}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+
+	envelope := decodeResponseEnvelope(t, rec)
+	if envelope.Code != "room_not_found" {
+		t.Fatalf("code = %q, want %q", envelope.Code, "room_not_found")
+	}
+}
+
+func TestCreateRoomRejectsAlreadyInRoom(t *testing.T) {
+	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManagerWithRNG(&fixedRoomRNG{value: 0}))
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	firstRec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms", token, `{"mode":"classic","base_score":1,"private":false}`)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first create status = %d, want %d", firstRec.Code, http.StatusOK)
+	}
+
+	secondRec := doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms", token, `{"mode":"classic","base_score":1,"private":false}`)
+	if secondRec.Code != http.StatusConflict {
+		t.Fatalf("second create status = %d, want %d", secondRec.Code, http.StatusConflict)
+	}
+
+	envelope := decodeResponseEnvelope(t, secondRec)
+	if envelope.Code != "already_in_room" {
+		t.Fatalf("code = %q, want %q", envelope.Code, "already_in_room")
+	}
+}
+
 func loginAndGetToken(t *testing.T, handler http.Handler, payload string) string {
 	t.Helper()
 
@@ -372,6 +541,43 @@ func loginAndGetToken(t *testing.T, handler http.Handler, payload string) string
 		t.Fatalf("decode guest login data: %v", err)
 	}
 	return data.AccessToken
+}
+
+func doAuthenticatedJSONRequest(t *testing.T, handler http.Handler, method string, path string, token string, payload string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	var body io.Reader
+	if payload != "" {
+		body = strings.NewReader(payload)
+	}
+
+	req := httptest.NewRequest(method, path, body)
+	if payload != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeResponseEnvelope(t *testing.T, rec *httptest.ResponseRecorder) apiResponseEnvelope {
+	t.Helper()
+
+	var envelope apiResponseEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return envelope
+}
+
+func decodeResponseData(t *testing.T, envelope apiResponseEnvelope, target any) {
+	t.Helper()
+
+	if err := json.Unmarshal(envelope.Data, target); err != nil {
+		t.Fatalf("decode response data: %v", err)
+	}
 }
 
 func testConfig() Config {

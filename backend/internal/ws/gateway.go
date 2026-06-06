@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"ddz/backend/internal/auth"
+	"ddz/backend/internal/game"
 	"ddz/backend/internal/room"
 
 	"github.com/gorilla/websocket"
@@ -41,6 +43,38 @@ type serverMessage struct {
 	Seq        uint64    `json:"seq"`
 	ServerTime time.Time `json:"server_time"`
 	Payload    any       `json:"payload"`
+}
+
+type clientMessage struct {
+	Type      string          `json:"type"`
+	RequestID *string         `json:"request_id"`
+	Seq       uint64          `json:"seq"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+type ackPayload struct {
+	Ok bool `json:"ok"`
+}
+
+type messageErrorPayload struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type pingPayload struct {
+	ClientTime string `json:"client_time"`
+}
+
+type readyPayload struct {
+	Ready bool `json:"ready"`
+}
+
+type bidPayload struct {
+	Score int `json:"score"`
+}
+
+type playCardsPayload struct {
+	Cards []string `json:"cards"`
 }
 
 // Gateway 负责房间 WebSocket 连接的升级、鉴权与生命周期管理。
@@ -198,9 +232,22 @@ func (c *clientConn) readLoop() {
 		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
 			continue
 		}
-		if _, err := io.Copy(io.Discard, reader); err != nil {
+
+		payload, err := io.ReadAll(reader)
+		if err != nil {
 			return
 		}
+
+		if messageType != websocket.TextMessage {
+			if err := c.sendError(nil, "bad_request", "bad request"); err != nil {
+				return
+			}
+			continue
+		}
+		if err := c.handleMessage(payload); err != nil {
+			return
+		}
+
 		_ = c.conn.SetReadDeadline(c.gateway.now().Add(defaultReadWait))
 	}
 }
@@ -267,6 +314,126 @@ func (c *clientConn) sendMessage(messageType string, requestID *string, payload 
 	}
 }
 
+func (c *clientConn) handleMessage(raw []byte) error {
+	var message clientMessage
+	if err := decodeJSON(raw, &message); err != nil {
+		return c.sendError(nil, "bad_request", "bad request")
+	}
+
+	switch message.Type {
+	case "ping":
+		return c.handlePing(message)
+	case "room.ready":
+		return c.handleReady(message)
+	case "game.bid":
+		return c.handleBid(message)
+	case "game.play_cards":
+		return c.handlePlayCards(message)
+	case "game.pass":
+		return c.handlePass(message)
+	case "":
+		return c.sendError(message.RequestID, "bad_request", "bad request")
+	default:
+		return c.sendError(message.RequestID, "unknown_message_type", "unknown message type")
+	}
+}
+
+func (c *clientConn) handlePing(message clientMessage) error {
+	var payload pingPayload
+	if err := decodePayload(message.Payload, &payload); err != nil {
+		return c.sendError(message.RequestID, "bad_request", "bad request")
+	}
+	return c.sendMessage("pong", message.RequestID, struct{}{})
+}
+
+func (c *clientConn) handleReady(message clientMessage) error {
+	var payload readyPayload
+	if err := decodePayload(message.Payload, &payload); err != nil {
+		return c.sendError(message.RequestID, "bad_request", "bad request")
+	}
+
+	if _, _, _, err := c.gateway.roomManager.Ready(room.ReadyInput{
+		RoomID: c.roomID,
+		UserID: c.userID,
+		Ready:  payload.Ready,
+	}); err != nil {
+		return c.sendActionError(message.RequestID, err)
+	}
+
+	return c.sendAck(message.RequestID)
+}
+
+func (c *clientConn) handleBid(message clientMessage) error {
+	var payload bidPayload
+	if err := decodePayload(message.Payload, &payload); err != nil {
+		return c.sendError(message.RequestID, "bad_request", "bad request")
+	}
+
+	if _, err := c.gateway.roomManager.Bid(room.BidInput{
+		RoomID: c.roomID,
+		UserID: c.userID,
+		Score:  payload.Score,
+	}); err != nil {
+		return c.sendActionError(message.RequestID, err)
+	}
+
+	return c.sendAck(message.RequestID)
+}
+
+func (c *clientConn) handlePlayCards(message clientMessage) error {
+	var payload playCardsPayload
+	if err := decodePayload(message.Payload, &payload); err != nil {
+		return c.sendError(message.RequestID, "bad_request", "bad request")
+	}
+
+	cards, err := parseCardCodes(payload.Cards)
+	if err != nil {
+		return c.sendError(message.RequestID, "invalid_card_set", "invalid card set")
+	}
+
+	if _, err := c.gateway.roomManager.PlayCards(room.PlayCardsInput{
+		RoomID: c.roomID,
+		UserID: c.userID,
+		Cards:  cards,
+	}); err != nil {
+		return c.sendActionError(message.RequestID, err)
+	}
+
+	return c.sendAck(message.RequestID)
+}
+
+func (c *clientConn) handlePass(message clientMessage) error {
+	var payload struct{}
+	if err := decodePayload(message.Payload, &payload); err != nil {
+		return c.sendError(message.RequestID, "bad_request", "bad request")
+	}
+
+	if _, err := c.gateway.roomManager.Pass(room.PassInput{
+		RoomID: c.roomID,
+		UserID: c.userID,
+	}); err != nil {
+		return c.sendActionError(message.RequestID, err)
+	}
+
+	return c.sendAck(message.RequestID)
+}
+
+func (c *clientConn) sendAck(requestID *string) error {
+	return c.sendMessage("ack", requestID, ackPayload{Ok: true})
+}
+
+func (c *clientConn) sendActionError(requestID *string, err error) error {
+	code, message := mapActionError(err)
+	return c.sendError(requestID, code, message)
+}
+
+func (c *clientConn) sendError(requestID *string, code string, message string) error {
+	return c.sendMessage("error", requestID, messageErrorPayload{
+		Code:    code,
+		Message: message,
+	})
+}
+
 func (c *clientConn) close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
@@ -320,6 +487,68 @@ func mapRoomError(err error) (int, string, string) {
 	default:
 		return http.StatusInternalServerError, "internal_error", "internal error"
 	}
+}
+
+func mapActionError(err error) (string, string) {
+	switch {
+	case errors.Is(err, room.ErrRoomNotFound), errors.Is(err, room.ErrRoomClosed):
+		return "room_not_found", "room not found"
+	case errors.Is(err, room.ErrUserNotInRoom):
+		return "not_in_room", "not in room"
+	case errors.Is(err, room.ErrGameNotStarted):
+		return "game_not_started", "game not started"
+	case errors.Is(err, room.ErrGameAlreadyStarted):
+		return "game_already_started", "game already started"
+	case errors.Is(err, room.ErrInvalidRoomConfig):
+		return "bad_request", "bad request"
+	case errors.Is(err, game.ErrInvalidGamePhase):
+		return "invalid_game_phase", "invalid game phase"
+	case errors.Is(err, game.ErrNotPlayerTurn):
+		return "not_player_turn", "not player turn"
+	case errors.Is(err, game.ErrInvalidBid):
+		return "invalid_bid", "invalid bid"
+	case errors.Is(err, game.ErrCannotPass):
+		return "cannot_pass", "cannot pass"
+	case errors.Is(err, game.ErrInvalidCardSet), errors.Is(err, game.ErrInvalidCardCode):
+		return "invalid_card_set", "invalid card set"
+	default:
+		return "internal_error", "internal error"
+	}
+}
+
+func decodeJSON(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
+func decodePayload(raw json.RawMessage, target any) error {
+	if len(raw) == 0 {
+		raw = []byte("{}")
+	}
+	return decodeJSON(raw, target)
+}
+
+func parseCardCodes(codes []string) ([]game.Card, error) {
+	if len(codes) == 0 {
+		return nil, nil
+	}
+
+	cards := make([]game.Card, 0, len(codes))
+	for _, code := range codes {
+		card, err := game.ParseCard(strings.TrimSpace(code))
+		if err != nil {
+			return nil, err
+		}
+		cards = append(cards, card)
+	}
+	return cards, nil
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, statusCode int, code string, message string) {

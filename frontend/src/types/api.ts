@@ -39,3 +39,46 @@ export interface CurrentUserResponse {
   account_type: string;
   profile: GuestProfile;
 }
+
+export interface LobbyModeSummary {
+  mode: string;
+  base_score: number;
+  online_players: number;
+  waiting_rooms: number;
+}
+
+export interface LobbySummaryResponse {
+  online_players: number;
+  active_rooms: number;
+  modes: LobbyModeSummary[];
+}
+
+export interface RoomListItem {
+  room_id: string;
+  mode: string;
+  status: string;
+  base_score: number;
+  player_count: number;
+  max_players: number;
+  created_at: string;
+}
+
+export interface RoomListResponse {
+  items: RoomListItem[];
+  page: number;
+  page_size: number;
+  total: number;
+}
+
+export interface RoomAccessResponse {
+  room_id: string;
+  seat_index: number;
+  ws_url: string;
+}
+
+export interface RoomListQuery {
+  mode?: string;
+  status?: string;
+  page?: number;
+  page_size?: number;
+}

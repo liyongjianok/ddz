@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"ddz/backend/internal/game"
 	"ddz/backend/internal/room"
 
 	"github.com/gorilla/websocket"
@@ -30,6 +32,54 @@ type wsAckPayload struct {
 type wsErrorPayload struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type wsRoomPlayerReadyPayload struct {
+	UserID    string `json:"user_id"`
+	SeatIndex int    `json:"seat_index"`
+	Ready     bool   `json:"ready"`
+}
+
+type wsGameBidPlacedPayload struct {
+	UserID        string    `json:"user_id"`
+	SeatIndex     int       `json:"seat_index"`
+	Score         int       `json:"score"`
+	NextSeatIndex int       `json:"next_seat_index"`
+	DeadlineAt    time.Time `json:"deadline_at"`
+}
+
+type wsGameLandlordDecidedPayload struct {
+	LandlordSeatIndex int       `json:"landlord_seat_index"`
+	LandlordUserID    string    `json:"landlord_user_id"`
+	BottomCards       []string  `json:"bottom_cards"`
+	Multiplier        int       `json:"multiplier"`
+	CurrentSeatIndex  int       `json:"current_seat_index"`
+	DeadlineAt        time.Time `json:"deadline_at"`
+}
+
+type wsGameCardsPlayedPayload struct {
+	UserID    string   `json:"user_id"`
+	SeatIndex int      `json:"seat_index"`
+	Cards     []string `json:"cards"`
+	CardGroup struct {
+		Type   string `json:"type"`
+		Rank   string `json:"rank"`
+		Length int    `json:"length"`
+	} `json:"card_group"`
+	RemainingCount int       `json:"remaining_count"`
+	NextSeatIndex  int       `json:"next_seat_index"`
+	DeadlineAt     time.Time `json:"deadline_at"`
+}
+
+type wsGameMyHandUpdatedPayload struct {
+	Cards []string `json:"cards"`
+}
+
+type wsGamePlayerPassedPayload struct {
+	UserID        string    `json:"user_id"`
+	SeatIndex     int       `json:"seat_index"`
+	NextSeatIndex int       `json:"next_seat_index"`
+	DeadlineAt    time.Time `json:"deadline_at"`
 }
 
 type wsTestUser struct {
@@ -360,6 +410,211 @@ func TestRoomWebSocketPassReturnsCannotPass(t *testing.T) {
 	assertWSErrorCode(t, envelope, "req_pass_1", "cannot_pass")
 }
 
+func TestRoomWebSocketReadyBroadcastsPublicEvent(t *testing.T) {
+	setup := newThreePlayerRoom(t)
+
+	server := httptest.NewServer(setup.Handler)
+	defer server.Close()
+
+	hostConn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.Host.Token)
+	defer hostConn.Close()
+	user2Conn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User2.Token)
+	defer user2Conn.Close()
+
+	sendWSJSON(t, hostConn, map[string]any{
+		"type":       "room.ready",
+		"request_id": "req_ready_broadcast_1",
+		"seq":        8,
+		"payload": map[string]any{
+			"ready": true,
+		},
+	})
+
+	assertWSAck(t, readWSEnvelope(t, hostConn), "req_ready_broadcast_1")
+
+	hostEvent := readWSEnvelope(t, hostConn)
+	assertRoomPlayerReadyEvent(t, hostEvent, "req_ready_broadcast_1", setup.Host.ID, 0, true)
+
+	user2Event := readWSEnvelope(t, user2Conn)
+	assertRoomPlayerReadyEvent(t, user2Event, "req_ready_broadcast_1", setup.Host.ID, 0, true)
+}
+
+func TestRoomWebSocketReadyStartsGameAndSendsPrivateSnapshots(t *testing.T) {
+	setup := newThreePlayerRoom(t)
+	if _, _, _, err := setup.Manager.Ready(room.ReadyInput{RoomID: setup.RoomID, UserID: setup.Host.ID, Ready: true}); err != nil {
+		t.Fatalf("Ready host error = %v", err)
+	}
+	if _, _, _, err := setup.Manager.Ready(room.ReadyInput{RoomID: setup.RoomID, UserID: setup.User2.ID, Ready: true}); err != nil {
+		t.Fatalf("Ready user2 error = %v", err)
+	}
+
+	server := httptest.NewServer(setup.Handler)
+	defer server.Close()
+
+	hostConn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.Host.Token)
+	defer hostConn.Close()
+	user2Conn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User2.Token)
+	defer user2Conn.Close()
+	user3Conn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User3.Token)
+	defer user3Conn.Close()
+
+	sendWSJSON(t, user3Conn, map[string]any{
+		"type":       "room.ready",
+		"request_id": "req_ready_start_1",
+		"seq":        9,
+		"payload": map[string]any{
+			"ready": true,
+		},
+	})
+
+	assertWSAck(t, readWSEnvelope(t, user3Conn), "req_ready_start_1")
+	assertRoomPlayerReadyEvent(t, readWSEnvelope(t, hostConn), "req_ready_start_1", setup.User3.ID, 2, true)
+	assertRoomPlayerReadyEvent(t, readWSEnvelope(t, user2Conn), "req_ready_start_1", setup.User3.ID, 2, true)
+	assertRoomPlayerReadyEvent(t, readWSEnvelope(t, user3Conn), "req_ready_start_1", setup.User3.ID, 2, true)
+
+	hostSnapshot := readRoomSnapshotEvent(t, hostConn)
+	user2Snapshot := readRoomSnapshotEvent(t, user2Conn)
+	user3Snapshot := readRoomSnapshotEvent(t, user3Conn)
+
+	assertStartedSnapshot(t, hostSnapshot, 17)
+	assertStartedSnapshot(t, user2Snapshot, 17)
+	assertStartedSnapshot(t, user3Snapshot, 17)
+}
+
+func TestRoomWebSocketBidBroadcastsLandlordDecidedAndPrivateHandUpdate(t *testing.T) {
+	setup := newThreePlayerRoom(t)
+	readyAllPlayers(t, setup)
+
+	server := httptest.NewServer(setup.Handler)
+	defer server.Close()
+
+	hostConn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.Host.Token)
+	defer hostConn.Close()
+	user2Conn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User2.Token)
+	defer user2Conn.Close()
+
+	sendWSJSON(t, hostConn, map[string]any{
+		"type":       "game.bid",
+		"request_id": "req_bid_broadcast_1",
+		"seq":        10,
+		"payload": map[string]any{
+			"score": 3,
+		},
+	})
+
+	assertWSAck(t, readWSEnvelope(t, hostConn), "req_bid_broadcast_1")
+
+	hostBidEvent := readWSEnvelope(t, hostConn)
+	user2BidEvent := readWSEnvelope(t, user2Conn)
+	assertBidPlacedEvent(t, hostBidEvent, "req_bid_broadcast_1", setup.Host.ID, 0, 3)
+	assertBidPlacedEvent(t, user2BidEvent, "req_bid_broadcast_1", setup.Host.ID, 0, 3)
+
+	hostLandlordEvent := readWSEnvelope(t, hostConn)
+	user2LandlordEvent := readWSEnvelope(t, user2Conn)
+	assertLandlordDecidedEvent(t, hostLandlordEvent, "req_bid_broadcast_1", setup.Host.ID, 0, 3)
+	assertLandlordDecidedEvent(t, user2LandlordEvent, "req_bid_broadcast_1", setup.Host.ID, 0, 3)
+
+	hostHandEvent := readWSEnvelope(t, hostConn)
+	assertHandUpdatedEvent(t, hostHandEvent, "req_bid_broadcast_1", 20)
+	assertNoWSMessage(t, user2Conn)
+}
+
+func TestRoomWebSocketPlayBroadcastsCardsPlayedAndPrivateHandUpdate(t *testing.T) {
+	setup := newThreePlayerRoom(t)
+	readyAllPlayers(t, setup)
+	if _, err := setup.Manager.Bid(room.BidInput{
+		RoomID: setup.RoomID,
+		UserID: setup.Host.ID,
+		Score:  3,
+	}); err != nil {
+		t.Fatalf("Bid() error = %v", err)
+	}
+
+	server := httptest.NewServer(setup.Handler)
+	defer server.Close()
+
+	hostConn, hostSnapshot := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.Host.Token)
+	defer hostConn.Close()
+	user2Conn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User2.Token)
+	defer user2Conn.Close()
+
+	if len(hostSnapshot.Me.Hand) == 0 {
+		t.Fatal("host hand should not be empty")
+	}
+	playCard := hostSnapshot.Me.Hand[0]
+
+	sendWSJSON(t, hostConn, map[string]any{
+		"type":       "game.play_cards",
+		"request_id": "req_play_broadcast_1",
+		"seq":        11,
+		"payload": map[string]any{
+			"cards": []string{playCard},
+		},
+	})
+
+	assertWSAck(t, readWSEnvelope(t, hostConn), "req_play_broadcast_1")
+
+	hostPlayedEvent := readWSEnvelope(t, hostConn)
+	user2PlayedEvent := readWSEnvelope(t, user2Conn)
+	assertCardsPlayedEvent(t, hostPlayedEvent, "req_play_broadcast_1", setup.Host.ID, 0, playCard, 19)
+	assertCardsPlayedEvent(t, user2PlayedEvent, "req_play_broadcast_1", setup.Host.ID, 0, playCard, 19)
+
+	hostHandEvent := readWSEnvelope(t, hostConn)
+	assertHandUpdatedEvent(t, hostHandEvent, "req_play_broadcast_1", 19)
+	assertNoWSMessage(t, user2Conn)
+}
+
+func TestRoomWebSocketPassBroadcastsPublicEvent(t *testing.T) {
+	setup := newThreePlayerRoom(t)
+	readyAllPlayers(t, setup)
+	if _, err := setup.Manager.Bid(room.BidInput{
+		RoomID: setup.RoomID,
+		UserID: setup.Host.ID,
+		Score:  3,
+	}); err != nil {
+		t.Fatalf("Bid() error = %v", err)
+	}
+
+	hostSnapshot, err := setup.Manager.GetRoomSnapshot(setup.RoomID, setup.Host.ID)
+	if err != nil {
+		t.Fatalf("GetRoomSnapshot() error = %v", err)
+	}
+	firstCard, err := game.ParseCard(hostSnapshot.Me.Hand[0])
+	if err != nil {
+		t.Fatalf("ParseCard() error = %v", err)
+	}
+	if _, err := setup.Manager.PlayCards(room.PlayCardsInput{
+		RoomID: setup.RoomID,
+		UserID: setup.Host.ID,
+		Cards:  []game.Card{firstCard},
+	}); err != nil {
+		t.Fatalf("PlayCards() error = %v", err)
+	}
+
+	server := httptest.NewServer(setup.Handler)
+	defer server.Close()
+
+	user2Conn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User2.Token)
+	defer user2Conn.Close()
+	user3Conn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User3.Token)
+	defer user3Conn.Close()
+
+	sendWSJSON(t, user2Conn, map[string]any{
+		"type":       "game.pass",
+		"request_id": "req_pass_broadcast_1",
+		"seq":        12,
+		"payload":    map[string]any{},
+	})
+
+	assertWSAck(t, readWSEnvelope(t, user2Conn), "req_pass_broadcast_1")
+
+	user2PassEvent := readWSEnvelope(t, user2Conn)
+	user3PassEvent := readWSEnvelope(t, user3Conn)
+	assertPlayerPassedEvent(t, user2PassEvent, "req_pass_broadcast_1", setup.User2.ID, 1)
+	assertPlayerPassedEvent(t, user3PassEvent, "req_pass_broadcast_1", setup.User2.ID, 1)
+	assertNoWSMessage(t, user3Conn)
+}
+
 func createRoomViaAPI(t *testing.T, handler http.Handler, token string, payload string) roomAccessData {
 	t.Helper()
 
@@ -484,6 +739,21 @@ func readWSEnvelope(t *testing.T, conn *websocket.Conn) wsServerEnvelope {
 	return envelope
 }
 
+func readRoomSnapshotEvent(t *testing.T, conn *websocket.Conn) room.RoomSnapshot {
+	t.Helper()
+
+	envelope := readWSEnvelope(t, conn)
+	if envelope.Type != "room.snapshot" {
+		t.Fatalf("type = %q, want %q", envelope.Type, "room.snapshot")
+	}
+
+	var snapshot room.RoomSnapshot
+	if err := json.Unmarshal(envelope.Payload, &snapshot); err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	return snapshot
+}
+
 func assertWSAck(t *testing.T, envelope wsServerEnvelope, requestID string) {
 	t.Helper()
 
@@ -519,6 +789,161 @@ func assertWSErrorCode(t *testing.T, envelope wsServerEnvelope, requestID string
 	}
 	if payload.Code != code {
 		t.Fatalf("error code = %q, want %q", payload.Code, code)
+	}
+}
+
+func assertRoomPlayerReadyEvent(t *testing.T, envelope wsServerEnvelope, requestID string, userID string, seatIndex int, ready bool) {
+	t.Helper()
+
+	if envelope.Type != "room.player_ready" {
+		t.Fatalf("type = %q, want %q", envelope.Type, "room.player_ready")
+	}
+	if envelope.RequestID == nil || *envelope.RequestID != requestID {
+		t.Fatalf("request_id = %v, want %q", envelope.RequestID, requestID)
+	}
+
+	var payload wsRoomPlayerReadyPayload
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal room.player_ready payload: %v", err)
+	}
+	if payload.UserID != userID || payload.SeatIndex != seatIndex || payload.Ready != ready {
+		t.Fatalf("payload = %+v, want user_id=%q seat_index=%d ready=%v", payload, userID, seatIndex, ready)
+	}
+}
+
+func assertStartedSnapshot(t *testing.T, snapshot room.RoomSnapshot, wantHandLen int) {
+	t.Helper()
+
+	if snapshot.Game == nil {
+		t.Fatal("snapshot game should not be nil")
+	}
+	if snapshot.Game.Phase != "bidding" {
+		t.Fatalf("game phase = %q, want %q", snapshot.Game.Phase, "bidding")
+	}
+	if len(snapshot.Me.Hand) != wantHandLen {
+		t.Fatalf("me hand len = %d, want %d", len(snapshot.Me.Hand), wantHandLen)
+	}
+}
+
+func assertBidPlacedEvent(t *testing.T, envelope wsServerEnvelope, requestID string, userID string, seatIndex int, score int) {
+	t.Helper()
+
+	if envelope.Type != "game.bid_placed" {
+		t.Fatalf("type = %q, want %q", envelope.Type, "game.bid_placed")
+	}
+	if envelope.RequestID == nil || *envelope.RequestID != requestID {
+		t.Fatalf("request_id = %v, want %q", envelope.RequestID, requestID)
+	}
+
+	var payload wsGameBidPlacedPayload
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal game.bid_placed payload: %v", err)
+	}
+	if payload.UserID != userID || payload.SeatIndex != seatIndex || payload.Score != score {
+		t.Fatalf("payload = %+v, want user_id=%q seat_index=%d score=%d", payload, userID, seatIndex, score)
+	}
+}
+
+func assertLandlordDecidedEvent(t *testing.T, envelope wsServerEnvelope, requestID string, landlordUserID string, landlordSeatIndex int, multiplier int) {
+	t.Helper()
+
+	if envelope.Type != "game.landlord_decided" {
+		t.Fatalf("type = %q, want %q", envelope.Type, "game.landlord_decided")
+	}
+	if envelope.RequestID == nil || *envelope.RequestID != requestID {
+		t.Fatalf("request_id = %v, want %q", envelope.RequestID, requestID)
+	}
+
+	var payload wsGameLandlordDecidedPayload
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal game.landlord_decided payload: %v", err)
+	}
+	if payload.LandlordUserID != landlordUserID || payload.LandlordSeatIndex != landlordSeatIndex || payload.Multiplier != multiplier {
+		t.Fatalf("payload = %+v, want landlord_user_id=%q landlord_seat_index=%d multiplier=%d", payload, landlordUserID, landlordSeatIndex, multiplier)
+	}
+	if len(payload.BottomCards) != 3 {
+		t.Fatalf("bottom_cards len = %d, want 3", len(payload.BottomCards))
+	}
+}
+
+func assertHandUpdatedEvent(t *testing.T, envelope wsServerEnvelope, requestID string, wantHandLen int) {
+	t.Helper()
+
+	if envelope.Type != "game.my_hand_updated" {
+		t.Fatalf("type = %q, want %q", envelope.Type, "game.my_hand_updated")
+	}
+	if envelope.RequestID == nil || *envelope.RequestID != requestID {
+		t.Fatalf("request_id = %v, want %q", envelope.RequestID, requestID)
+	}
+
+	var payload wsGameMyHandUpdatedPayload
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal game.my_hand_updated payload: %v", err)
+	}
+	if len(payload.Cards) != wantHandLen {
+		t.Fatalf("hand len = %d, want %d", len(payload.Cards), wantHandLen)
+	}
+}
+
+func assertCardsPlayedEvent(t *testing.T, envelope wsServerEnvelope, requestID string, userID string, seatIndex int, card string, remainingCount int) {
+	t.Helper()
+
+	if envelope.Type != "game.cards_played" {
+		t.Fatalf("type = %q, want %q", envelope.Type, "game.cards_played")
+	}
+	if envelope.RequestID == nil || *envelope.RequestID != requestID {
+		t.Fatalf("request_id = %v, want %q", envelope.RequestID, requestID)
+	}
+
+	var payload wsGameCardsPlayedPayload
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal game.cards_played payload: %v", err)
+	}
+	if payload.UserID != userID || payload.SeatIndex != seatIndex {
+		t.Fatalf("payload = %+v, want user_id=%q seat_index=%d", payload, userID, seatIndex)
+	}
+	if len(payload.Cards) != 1 || payload.Cards[0] != card {
+		t.Fatalf("cards = %+v, want [%q]", payload.Cards, card)
+	}
+	if payload.RemainingCount != remainingCount {
+		t.Fatalf("remaining_count = %d, want %d", payload.RemainingCount, remainingCount)
+	}
+}
+
+func assertPlayerPassedEvent(t *testing.T, envelope wsServerEnvelope, requestID string, userID string, seatIndex int) {
+	t.Helper()
+
+	if envelope.Type != "game.player_passed" {
+		t.Fatalf("type = %q, want %q", envelope.Type, "game.player_passed")
+	}
+	if envelope.RequestID == nil || *envelope.RequestID != requestID {
+		t.Fatalf("request_id = %v, want %q", envelope.RequestID, requestID)
+	}
+
+	var payload wsGamePlayerPassedPayload
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal game.player_passed payload: %v", err)
+	}
+	if payload.UserID != userID || payload.SeatIndex != seatIndex {
+		t.Fatalf("payload = %+v, want user_id=%q seat_index=%d", payload, userID, seatIndex)
+	}
+}
+
+func assertNoWSMessage(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+
+	_ = conn.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
+	defer conn.SetReadDeadline(time.Time{})
+
+	var envelope wsServerEnvelope
+	err := conn.ReadJSON(&envelope)
+	if err == nil {
+		t.Fatalf("unexpected websocket message: %+v", envelope)
+	}
+
+	netErr, ok := err.(net.Error)
+	if !ok || !netErr.Timeout() {
+		t.Fatalf("expected timeout, got %v", err)
 	}
 }
 

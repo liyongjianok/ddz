@@ -77,6 +77,71 @@ type playCardsPayload struct {
 	Cards []string `json:"cards"`
 }
 
+type roomPlayerReadyEvent struct {
+	UserID    string `json:"user_id"`
+	SeatIndex int    `json:"seat_index"`
+	Ready     bool   `json:"ready"`
+}
+
+type gameBidPlacedEvent struct {
+	UserID        string    `json:"user_id"`
+	SeatIndex     int       `json:"seat_index"`
+	Score         int       `json:"score"`
+	NextSeatIndex int       `json:"next_seat_index"`
+	DeadlineAt    time.Time `json:"deadline_at,omitempty"`
+}
+
+type gameLandlordDecidedEvent struct {
+	LandlordSeatIndex int       `json:"landlord_seat_index"`
+	LandlordUserID    string    `json:"landlord_user_id"`
+	BottomCards       []string  `json:"bottom_cards"`
+	Multiplier        int       `json:"multiplier"`
+	CurrentSeatIndex  int       `json:"current_seat_index"`
+	DeadlineAt        time.Time `json:"deadline_at,omitempty"`
+}
+
+type gameCardsPlayedEvent struct {
+	UserID         string               `json:"user_id"`
+	SeatIndex      int                  `json:"seat_index"`
+	Cards          []string             `json:"cards"`
+	CardGroup      gameCardsPlayedGroup `json:"card_group"`
+	RemainingCount int                  `json:"remaining_count"`
+	NextSeatIndex  int                  `json:"next_seat_index"`
+	DeadlineAt     time.Time            `json:"deadline_at,omitempty"`
+}
+
+type gameCardsPlayedGroup struct {
+	Type        string   `json:"type"`
+	Rank        string   `json:"rank"`
+	Length      int      `json:"length"`
+	Attachments []string `json:"attachments,omitempty"`
+}
+
+type gameMyHandUpdatedEvent struct {
+	Cards []string `json:"cards"`
+}
+
+type gamePlayerPassedEvent struct {
+	UserID        string    `json:"user_id"`
+	SeatIndex     int       `json:"seat_index"`
+	NextSeatIndex int       `json:"next_seat_index"`
+	DeadlineAt    time.Time `json:"deadline_at,omitempty"`
+}
+
+type gameEndedEvent struct {
+	WinnerSide      string                     `json:"winner_side"`
+	WinnerUserID    string                     `json:"winner_user_id"`
+	Settlements     []gameEndedSettlementEvent `json:"settlements"`
+	FinalMultiplier int                        `json:"final_multiplier"`
+}
+
+type gameEndedSettlementEvent struct {
+	UserID     string `json:"user_id"`
+	SeatIndex  int    `json:"seat_index"`
+	Role       string `json:"role"`
+	ScoreDelta int    `json:"score_delta"`
+}
+
 // Gateway 负责房间 WebSocket 连接的升级、鉴权与生命周期管理。
 type Gateway struct {
 	jwt         *auth.JWTManager
@@ -207,6 +272,56 @@ func (g *Gateway) unregister(client *clientConn) {
 	g.mu.Unlock()
 
 	client.close()
+}
+
+func (g *Gateway) roomClients(roomID string) []*clientConn {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	roomClients := g.rooms[roomID]
+	if len(roomClients) == 0 {
+		return nil
+	}
+
+	clients := make([]*clientConn, 0, len(roomClients))
+	for _, client := range roomClients {
+		clients = append(clients, client)
+	}
+	return clients
+}
+
+func (g *Gateway) sendToUser(roomID string, userID string, messageType string, requestID *string, payload any) {
+	clients := g.roomClients(roomID)
+	for _, client := range clients {
+		if client.userID != userID {
+			continue
+		}
+		if err := client.sendMessage(messageType, requestID, payload); err != nil {
+			g.unregister(client)
+		}
+	}
+}
+
+func (g *Gateway) broadcast(roomID string, messageType string, requestID *string, payload any) {
+	clients := g.roomClients(roomID)
+	for _, client := range clients {
+		if err := client.sendMessage(messageType, requestID, payload); err != nil {
+			g.unregister(client)
+		}
+	}
+}
+
+func (g *Gateway) broadcastRoomSnapshots(roomID string) {
+	clients := g.roomClients(roomID)
+	for _, client := range clients {
+		snapshot, err := g.roomManager.GetRoomSnapshot(roomID, client.userID)
+		if err != nil {
+			continue
+		}
+		if err := client.sendMessage("room.snapshot", nil, snapshot); err != nil {
+			g.unregister(client)
+		}
+	}
 }
 
 func (c *clientConn) readLoop() {
@@ -352,15 +467,29 @@ func (c *clientConn) handleReady(message clientMessage) error {
 		return c.sendError(message.RequestID, "bad_request", "bad request")
 	}
 
-	if _, _, _, err := c.gateway.roomManager.Ready(room.ReadyInput{
+	currentRoom, seatIndex, started, err := c.gateway.roomManager.Ready(room.ReadyInput{
 		RoomID: c.roomID,
 		UserID: c.userID,
 		Ready:  payload.Ready,
-	}); err != nil {
+	})
+	if err != nil {
 		return c.sendActionError(message.RequestID, err)
 	}
 
-	return c.sendAck(message.RequestID)
+	if err := c.sendAck(message.RequestID); err != nil {
+		return err
+	}
+
+	c.gateway.broadcast(c.roomID, "room.player_ready", message.RequestID, roomPlayerReadyEvent{
+		UserID:    c.userID,
+		SeatIndex: seatIndex,
+		Ready:     payload.Ready,
+	})
+	if started && currentRoom != nil {
+		c.gateway.broadcastRoomSnapshots(c.roomID)
+	}
+
+	return nil
 }
 
 func (c *clientConn) handleBid(message clientMessage) error {
@@ -369,15 +498,49 @@ func (c *clientConn) handleBid(message clientMessage) error {
 		return c.sendError(message.RequestID, "bad_request", "bad request")
 	}
 
-	if _, err := c.gateway.roomManager.Bid(room.BidInput{
+	currentRoom, err := c.gateway.roomManager.Bid(room.BidInput{
 		RoomID: c.roomID,
 		UserID: c.userID,
 		Score:  payload.Score,
-	}); err != nil {
+	})
+	if err != nil {
 		return c.sendActionError(message.RequestID, err)
 	}
 
-	return c.sendAck(message.RequestID)
+	if err := c.sendAck(message.RequestID); err != nil {
+		return err
+	}
+	if currentRoom == nil || currentRoom.CurrentGame == nil {
+		return nil
+	}
+
+	seatIndex, ok := findSeatIndexByUserID(currentRoom.CurrentGame.Players, c.userID)
+	if !ok {
+		return nil
+	}
+	c.gateway.broadcast(c.roomID, "game.bid_placed", message.RequestID, gameBidPlacedEvent{
+		UserID:        c.userID,
+		SeatIndex:     seatIndex,
+		Score:         payload.Score,
+		NextSeatIndex: currentRoom.CurrentGame.CurrentSeatIndex,
+		DeadlineAt:    currentRoom.DeadlineAt,
+	})
+
+	if currentRoom.CurrentGame.Phase == game.GamePhasePlaying && currentRoom.CurrentGame.LandlordSeatIndex >= 0 {
+		landlordPlayer := currentRoom.CurrentGame.Players[currentRoom.CurrentGame.LandlordSeatIndex]
+		c.gateway.broadcast(c.roomID, "game.landlord_decided", message.RequestID, gameLandlordDecidedEvent{
+			LandlordSeatIndex: currentRoom.CurrentGame.LandlordSeatIndex,
+			LandlordUserID:    landlordPlayer.UserID,
+			BottomCards:       cardCodes(currentRoom.CurrentGame.BottomCards),
+			Multiplier:        currentRoom.CurrentGame.Multiplier,
+			CurrentSeatIndex:  currentRoom.CurrentGame.CurrentSeatIndex,
+			DeadlineAt:        currentRoom.DeadlineAt,
+		})
+
+		c.gateway.sendHandUpdated(c.roomID, landlordPlayer.UserID, message.RequestID)
+	}
+
+	return nil
 }
 
 func (c *clientConn) handlePlayCards(message clientMessage) error {
@@ -391,15 +554,45 @@ func (c *clientConn) handlePlayCards(message clientMessage) error {
 		return c.sendError(message.RequestID, "invalid_card_set", "invalid card set")
 	}
 
-	if _, err := c.gateway.roomManager.PlayCards(room.PlayCardsInput{
+	currentRoom, err := c.gateway.roomManager.PlayCards(room.PlayCardsInput{
 		RoomID: c.roomID,
 		UserID: c.userID,
 		Cards:  cards,
-	}); err != nil {
+	})
+	if err != nil {
 		return c.sendActionError(message.RequestID, err)
 	}
 
-	return c.sendAck(message.RequestID)
+	if err := c.sendAck(message.RequestID); err != nil {
+		return err
+	}
+	if currentRoom == nil || currentRoom.CurrentGame == nil || currentRoom.CurrentGame.LastPlay == nil {
+		return nil
+	}
+
+	lastPlay := currentRoom.CurrentGame.LastPlay
+	remainingCount, _ := findRemainingCountByUserID(currentRoom.CurrentGame.Players, c.userID)
+	c.gateway.broadcast(c.roomID, "game.cards_played", message.RequestID, gameCardsPlayedEvent{
+		UserID:    c.userID,
+		SeatIndex: lastPlay.SeatIndex,
+		Cards:     cardCodes(lastPlay.Cards),
+		CardGroup: gameCardsPlayedGroup{
+			Type:        string(lastPlay.Group.Type),
+			Rank:        lastPlay.Group.PrimaryRank.String(),
+			Length:      lastPlay.Group.Length,
+			Attachments: cardCodes(lastPlay.Group.Attachments),
+		},
+		RemainingCount: remainingCount,
+		NextSeatIndex:  currentRoom.CurrentGame.CurrentSeatIndex,
+		DeadlineAt:     currentRoom.DeadlineAt,
+	})
+	c.gateway.sendHandUpdated(c.roomID, c.userID, message.RequestID)
+
+	if currentRoom.CurrentGame.Phase == game.GamePhaseEnded || currentRoom.Status == room.RoomStatusSettling {
+		c.gateway.broadcastGameEnded(currentRoom, message.RequestID)
+	}
+
+	return nil
 }
 
 func (c *clientConn) handlePass(message clientMessage) error {
@@ -408,14 +601,33 @@ func (c *clientConn) handlePass(message clientMessage) error {
 		return c.sendError(message.RequestID, "bad_request", "bad request")
 	}
 
-	if _, err := c.gateway.roomManager.Pass(room.PassInput{
+	currentRoom, err := c.gateway.roomManager.Pass(room.PassInput{
 		RoomID: c.roomID,
 		UserID: c.userID,
-	}); err != nil {
+	})
+	if err != nil {
 		return c.sendActionError(message.RequestID, err)
 	}
 
-	return c.sendAck(message.RequestID)
+	if err := c.sendAck(message.RequestID); err != nil {
+		return err
+	}
+	if currentRoom == nil || currentRoom.CurrentGame == nil {
+		return nil
+	}
+
+	seatIndex, ok := findSeatIndexByUserID(currentRoom.CurrentGame.Players, c.userID)
+	if !ok {
+		return nil
+	}
+	c.gateway.broadcast(c.roomID, "game.player_passed", message.RequestID, gamePlayerPassedEvent{
+		UserID:        c.userID,
+		SeatIndex:     seatIndex,
+		NextSeatIndex: currentRoom.CurrentGame.CurrentSeatIndex,
+		DeadlineAt:    currentRoom.DeadlineAt,
+	})
+
+	return nil
 }
 
 func (c *clientConn) sendAck(requestID *string) error {
@@ -514,6 +726,78 @@ func mapActionError(err error) (string, string) {
 	default:
 		return "internal_error", "internal error"
 	}
+}
+
+func (g *Gateway) sendHandUpdated(roomID string, userID string, requestID *string) {
+	snapshot, err := g.roomManager.GetRoomSnapshot(roomID, userID)
+	if err != nil {
+		return
+	}
+
+	g.sendToUser(roomID, userID, "game.my_hand_updated", requestID, gameMyHandUpdatedEvent{
+		Cards: snapshot.Me.Hand,
+	})
+}
+
+func (g *Gateway) broadcastGameEnded(currentRoom *room.Room, requestID *string) {
+	if currentRoom == nil || currentRoom.CurrentGame == nil || currentRoom.CurrentGame.Settlement == nil {
+		return
+	}
+
+	winnerUserID := ""
+	for _, player := range currentRoom.CurrentGame.Settlement.Players {
+		if player.IsWinner {
+			winnerUserID = player.UserID
+			break
+		}
+	}
+
+	settlements := make([]gameEndedSettlementEvent, 0, len(currentRoom.CurrentGame.Settlement.Players))
+	for _, player := range currentRoom.CurrentGame.Settlement.Players {
+		settlements = append(settlements, gameEndedSettlementEvent{
+			UserID:     player.UserID,
+			SeatIndex:  player.SeatIndex,
+			Role:       string(player.Role),
+			ScoreDelta: player.DeltaScore,
+		})
+	}
+
+	g.broadcast(currentRoom.ID, "game.ended", requestID, gameEndedEvent{
+		WinnerSide:      string(currentRoom.CurrentGame.Settlement.WinnerSide),
+		WinnerUserID:    winnerUserID,
+		Settlements:     settlements,
+		FinalMultiplier: currentRoom.CurrentGame.Settlement.Multiplier,
+	})
+}
+
+func cardCodes(cards []game.Card) []string {
+	if len(cards) == 0 {
+		return nil
+	}
+
+	result := make([]string, 0, len(cards))
+	for _, card := range cards {
+		result = append(result, card.Code())
+	}
+	return result
+}
+
+func findSeatIndexByUserID(players []game.PlayerState, userID string) (int, bool) {
+	for _, player := range players {
+		if player.UserID == userID {
+			return player.SeatIndex, true
+		}
+	}
+	return -1, false
+}
+
+func findRemainingCountByUserID(players []game.PlayerState, userID string) (int, bool) {
+	for _, player := range players {
+		if player.UserID == userID {
+			return player.RemainingCount, true
+		}
+	}
+	return 0, false
 }
 
 func decodeJSON(raw []byte, target any) error {

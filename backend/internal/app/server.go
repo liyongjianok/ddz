@@ -10,6 +10,7 @@ import (
 
 	"ddz/backend/internal/auth"
 	"ddz/backend/internal/room"
+	"ddz/backend/internal/ws"
 )
 
 type apiResponse struct {
@@ -96,6 +97,7 @@ func NewHTTPHandlerWithManager(cfg Config, roomManager *room.Manager) http.Handl
 		authMiddleware: auth.NewMiddleware(jwtManager),
 		roomManager:    roomManager,
 	}
+	wsGateway := ws.NewGateway(jwtManager, roomManager)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
@@ -105,6 +107,7 @@ func NewHTTPHandlerWithManager(cfg Config, roomManager *room.Manager) http.Handl
 	mux.Handle("/api/v1/matchmaking/quick-start", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleQuickStart)))
 	mux.Handle("/api/v1/rooms", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleRooms)))
 	mux.Handle("/api/v1/rooms/", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleRoomActions)))
+	mux.Handle("/ws/v1/rooms/", wsGateway)
 	return mux
 }
 

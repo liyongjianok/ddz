@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"ddz/backend/internal/profile"
 	"ddz/backend/internal/record"
 	"ddz/backend/internal/room"
+	"ddz/backend/internal/telemetry"
 
 	"github.com/gorilla/websocket"
 )
@@ -153,11 +155,17 @@ type Gateway struct {
 	roomManager *room.Manager
 	recordSvc   *record.Service
 	profileSvc  *profile.Service
+	logger      *slog.Logger
+	metrics     wsMetrics
 	upgrader    websocket.Upgrader
 	now         func() time.Time
 
 	mu    sync.Mutex
 	rooms map[string]map[string]*clientConn
+}
+
+type wsMetrics interface {
+	AddWSConnection(delta int64)
 }
 
 type clientConn struct {
@@ -174,12 +182,17 @@ type clientConn struct {
 }
 
 // NewGateway 创建房间 WebSocket 网关。
-func NewGateway(jwt *auth.JWTManager, roomManager *room.Manager, recordSvc *record.Service, profileSvc *profile.Service) *Gateway {
+func NewGateway(jwt *auth.JWTManager, roomManager *room.Manager, recordSvc *record.Service, profileSvc *profile.Service, logger *slog.Logger, metrics wsMetrics) *Gateway {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Gateway{
 		jwt:         jwt,
 		roomManager: roomManager,
 		recordSvc:   recordSvc,
 		profileSvc:  profileSvc,
+		logger:      logger,
+		metrics:     metrics,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool {
 				return true
@@ -259,6 +272,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	g.register(client)
+	g.logRoomEvent("ws_connected", claims.Subject, roomID, snapshotGameID(snapshot))
 	go client.writeLoop()
 
 	if err := client.sendMessage("room.snapshot", nil, snapshot); err != nil {
@@ -270,6 +284,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) register(client *clientConn) {
+	if g.metrics != nil {
+		g.metrics.AddWSConnection(1)
+	}
 	g.mu.Lock()
 	roomClients := g.rooms[client.roomID]
 	if roomClients == nil {
@@ -305,6 +322,10 @@ func (g *Gateway) unregister(client *clientConn) {
 	g.mu.Unlock()
 
 	client.close()
+	if g.metrics != nil {
+		g.metrics.AddWSConnection(-1)
+	}
+	g.logRoomEvent("ws_disconnected", client.userID, client.roomID, "")
 
 	if shouldMarkOffline {
 		if _, err := g.roomManager.SetPlayerOnline(client.roomID, client.userID, false); err == nil {
@@ -560,6 +581,7 @@ func (c *clientConn) handleReady(message clientMessage) error {
 		SeatIndex: seatIndex,
 		Ready:     payload.Ready,
 	})
+	c.gateway.logRoomEvent("room_ready_changed", c.userID, c.roomID, roomGameID(currentRoom))
 	if started && currentRoom != nil {
 		c.gateway.broadcastRoomSnapshots(c.roomID)
 		c.gateway.scheduleRobotTurn(c.roomID)
@@ -597,6 +619,7 @@ func (c *clientConn) handleBid(message clientMessage) error {
 		return nil
 	}
 	c.gateway.appendBidEvent(currentRoom, c.userID, seatIndex, payload.Score)
+	c.gateway.logRoomEvent("game_bid", c.userID, c.roomID, roomGameID(currentRoom))
 	c.gateway.broadcast(c.roomID, "game.bid_placed", message.RequestID, gameBidPlacedEvent{
 		UserID:        c.userID,
 		SeatIndex:     seatIndex,
@@ -653,6 +676,7 @@ func (c *clientConn) handlePlayCards(message clientMessage) error {
 	lastPlay := currentRoom.CurrentGame.LastPlay
 	remainingCount, _ := findRemainingCountByUserID(currentRoom.CurrentGame.Players, c.userID)
 	c.gateway.appendPlayEvent(currentRoom, c.userID, lastPlay, remainingCount)
+	c.gateway.logRoomEvent("game_play_cards", c.userID, c.roomID, roomGameID(currentRoom))
 	c.gateway.broadcast(c.roomID, "game.cards_played", message.RequestID, gameCardsPlayedEvent{
 		UserID:    c.userID,
 		SeatIndex: lastPlay.SeatIndex,
@@ -704,6 +728,7 @@ func (c *clientConn) handlePass(message clientMessage) error {
 		return nil
 	}
 	c.gateway.appendPassEvent(currentRoom, c.userID, seatIndex)
+	c.gateway.logRoomEvent("game_pass", c.userID, c.roomID, roomGameID(currentRoom))
 	c.gateway.broadcast(c.roomID, "game.player_passed", message.RequestID, gamePlayerPassedEvent{
 		UserID:        c.userID,
 		SeatIndex:     seatIndex,
@@ -848,6 +873,7 @@ func (g *Gateway) finalizeGameRecord(currentRoom *room.Room) {
 	if g.profileSvc != nil {
 		_ = g.profileSvc.ApplySettlementFromRoom(context.Background(), currentRoom)
 	}
+	g.logRoomEvent("game_settled", "", currentRoom.ID, roomGameID(currentRoom))
 }
 
 func (g *Gateway) persistAutoAction(beforeRoom *room.Room, currentRoom *room.Room, action room.TimeoutAction) {
@@ -1015,4 +1041,35 @@ func writeError(w http.ResponseWriter, r *http.Request, statusCode int, code str
 		Data:      nil,
 		RequestID: r.Header.Get("X-Request-ID"),
 	})
+}
+
+func (g *Gateway) logRoomEvent(eventType string, userID string, roomID string, gameID string) {
+	if g.logger == nil {
+		return
+	}
+	g.logger.Info(eventType,
+		"trace_id", racyTraceID(),
+		"user_id", userID,
+		"room_id", roomID,
+		"game_id", gameID,
+		"event_type", eventType,
+	)
+}
+
+func roomGameID(currentRoom *room.Room) string {
+	if currentRoom == nil || currentRoom.CurrentGame == nil {
+		return ""
+	}
+	return currentRoom.CurrentGame.ID
+}
+
+func snapshotGameID(snapshot *room.RoomSnapshot) string {
+	if snapshot == nil || snapshot.Game == nil {
+		return ""
+	}
+	return snapshot.Game.GameID
+}
+
+func racyTraceID() string {
+	return telemetry.NewTraceID()
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -78,6 +79,9 @@ type httpApp struct {
 	roomManager    *room.Manager
 	recordService  *record.Service
 	profileService *profile.Service
+	metrics        *metricsCollector
+	logger         *slog.Logger
+	cfg            Config
 }
 
 func NewHTTPServer(cfg Config) *http.Server {
@@ -121,6 +125,7 @@ func NewHTTPHandlerWithDependencies(cfg Config, roomManager *room.Manager, recor
 
 // NewHTTPHandlerWithServices 创建带显式依赖的 HTTP Handler。
 func NewHTTPHandlerWithServices(cfg Config, roomManager *room.Manager, recordService *record.Service, profileService *profile.Service) http.Handler {
+	logger := newLogger(cfg)
 	jwtManager, err := auth.NewJWTManager(cfg.JWTSecret, cfg.AccessTokenTTL)
 	if err != nil {
 		panic(err)
@@ -134,6 +139,7 @@ func NewHTTPHandlerWithServices(cfg Config, roomManager *room.Manager, recordSer
 	if profileService == nil {
 		profileService = profile.NewService(NewProfileStore(cfg, NewRedisStore(cfg)))
 	}
+	metrics := newMetricsCollector(nil)
 
 	app := &httpApp{
 		authService:    auth.NewService(jwtManager, profileService),
@@ -141,11 +147,16 @@ func NewHTTPHandlerWithServices(cfg Config, roomManager *room.Manager, recordSer
 		roomManager:    roomManager,
 		recordService:  recordService,
 		profileService: profileService,
+		metrics:        metrics,
+		logger:         logger,
+		cfg:            cfg,
 	}
-	wsGateway := ws.NewGateway(jwtManager, roomManager, recordService, profileService)
+	wsGateway := ws.NewGateway(jwtManager, roomManager, recordService, profileService, logger, metrics)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/readyz", app.handleReadyz)
+	mux.HandleFunc("/metrics", app.handleMetrics)
 	mux.HandleFunc("/api/v1/auth/guest", app.handleGuestLogin)
 	mux.Handle("/api/v1/auth/me", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleCurrentUser)))
 	mux.Handle("/api/v1/lobby/summary", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleLobbySummary)))
@@ -155,7 +166,7 @@ func NewHTTPHandlerWithServices(cfg Config, roomManager *room.Manager, recordSer
 	mux.Handle("/api/v1/rooms", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleRooms)))
 	mux.Handle("/api/v1/rooms/", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleRoomActions)))
 	mux.Handle("/ws/v1/rooms/", wsGateway)
-	return mux
+	return withObservability(mux, logger, metrics)
 }
 
 func (a *httpApp) handleGuestLogin(w http.ResponseWriter, r *http.Request) {
@@ -502,6 +513,31 @@ func (a *httpApp) handleRecordDetail(w http.ResponseWriter, r *http.Request) {
 		Data:      result,
 		RequestID: requestIDFromRequest(r),
 	})
+}
+
+func (a *httpApp) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
+		return
+	}
+
+	checks := map[string]string{
+		"http":    "ok",
+		"redis":   "ok",
+		"storage": "ok",
+	}
+	if strings.TrimSpace(a.cfg.RedisURL) == "" {
+		checks["redis"] = "not_configured"
+	}
+	writeReadyz(w, checks)
+}
+
+func (a *httpApp) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
+		return
+	}
+	writeMetrics(w, a.metrics)
 }
 
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {

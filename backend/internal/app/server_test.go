@@ -110,6 +110,19 @@ type recordDetailData struct {
 	Events     []record.Event        `json:"events"`
 }
 
+type readyzData struct {
+	Status    string            `json:"status"`
+	Checks    map[string]string `json:"checks"`
+	Timestamp time.Time         `json:"timestamp"`
+}
+
+type metricsData struct {
+	UptimeSeconds     int64            `json:"uptime_seconds"`
+	HTTPRequestsTotal uint64           `json:"http_requests_total"`
+	WSConnections     int64            `json:"ws_connections"`
+	HTTPLatencyByPath map[string]int64 `json:"http_latency_ms_by_path"`
+}
+
 func TestHealthzReturnsOK(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -129,6 +142,66 @@ func TestHealthzReturnsOK(t *testing.T) {
 	}
 	if string(body) != "ok\n" {
 		t.Fatalf("body = %q, want %q", string(body), "ok\n")
+	}
+}
+
+func TestReadyzReturnsChecks(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+
+	NewHTTPHandler(testConfig()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var data readyzData
+	if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+		t.Fatalf("decode readyz: %v", err)
+	}
+	if data.Status == "" {
+		t.Fatal("status should not be empty")
+	}
+	if data.Checks["http"] != "ok" {
+		t.Fatalf("http check = %q, want %q", data.Checks["http"], "ok")
+	}
+}
+
+func TestMetricsReturnsSnapshot(t *testing.T) {
+	handler := NewHTTPHandler(testConfig())
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	firstRec := httptest.NewRecorder()
+	handler.ServeHTTP(firstRec, firstReq)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var data metricsData
+	if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+		t.Fatalf("decode metrics: %v", err)
+	}
+	if data.HTTPRequestsTotal == 0 {
+		t.Fatal("http_requests_total should be greater than zero")
+	}
+	if _, ok := data.HTTPLatencyByPath["/healthz"]; !ok {
+		t.Fatal("expected /healthz latency metric")
+	}
+}
+
+func TestRequestGetsGeneratedTraceIDWhenMissing(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	NewHTTPHandler(testConfig()).ServeHTTP(rec, req)
+
+	if rec.Header().Get("X-Request-ID") == "" {
+		t.Fatal("X-Request-ID should be generated")
 	}
 }
 
@@ -722,6 +795,7 @@ func testConfig() Config {
 	return Config{
 		AppEnv:         "test",
 		HTTPAddr:       ":18080",
+		LogLevel:       "debug",
 		JWTSecret:      "test-secret",
 		AccessTokenTTL: 24 * time.Hour,
 	}

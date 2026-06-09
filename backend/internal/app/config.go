@@ -11,6 +11,7 @@ const (
 	defaultJWTSecret      = "change-me"
 	defaultAccessTokenTTL = 24 * time.Hour
 	defaultReconnectTTL   = 5 * time.Minute
+	defaultLogLevel       = "info"
 )
 
 type Config struct {
@@ -18,6 +19,7 @@ type Config struct {
 	HTTPAddr       string
 	RedisURL       string
 	JWTSecret      string
+	LogLevel       string
 	AccessTokenTTL time.Duration
 	ReconnectTTL   time.Duration
 }
@@ -28,6 +30,7 @@ func LoadConfig() Config {
 		HTTPAddr:       getenv("HTTP_ADDR", defaultHTTPAddr),
 		RedisURL:       getenv("REDIS_URL", ""),
 		JWTSecret:      getenv("JWT_SECRET", defaultJWTSecret),
+		LogLevel:       getenv("LOG_LEVEL", defaultLogLevel),
 		AccessTokenTTL: getenvDuration("ACCESS_TOKEN_TTL", defaultAccessTokenTTL),
 		ReconnectTTL:   getenvDuration("RECONNECT_TTL", defaultReconnectTTL),
 	}

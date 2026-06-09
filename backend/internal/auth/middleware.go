@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"ddz/backend/internal/telemetry"
 )
 
 type claimsContextKey struct{}
@@ -47,6 +49,9 @@ func (m *Middleware) RequireAuth(next http.Handler) http.Handler {
 		}
 
 		ctx := context.WithValue(r.Context(), claimsContextKey{}, claims)
+		if meta, ok := telemetry.RequestMetaFromContext(ctx); ok && meta != nil {
+			meta.UserID = claims.Subject
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

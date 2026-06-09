@@ -10,6 +10,7 @@ func TestLoadConfigUsesDefaults(t *testing.T) {
 	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("REDIS_URL", "")
 	t.Setenv("JWT_SECRET", "")
+	t.Setenv("LOG_LEVEL", "")
 	t.Setenv("ACCESS_TOKEN_TTL", "")
 	t.Setenv("RECONNECT_TTL", "")
 
@@ -27,6 +28,9 @@ func TestLoadConfigUsesDefaults(t *testing.T) {
 	if cfg.JWTSecret != "change-me" {
 		t.Fatalf("JWTSecret = %q, want %q", cfg.JWTSecret, "change-me")
 	}
+	if cfg.LogLevel != "info" {
+		t.Fatalf("LogLevel = %q, want %q", cfg.LogLevel, "info")
+	}
 	if cfg.AccessTokenTTL != 24*time.Hour {
 		t.Fatalf("AccessTokenTTL = %v, want %v", cfg.AccessTokenTTL, 24*time.Hour)
 	}
@@ -40,6 +44,7 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	t.Setenv("HTTP_ADDR", ":18080")
 	t.Setenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("ACCESS_TOKEN_TTL", "12h")
 	t.Setenv("RECONNECT_TTL", "10m")
 
@@ -56,6 +61,9 @@ func TestLoadConfigReadsEnvironment(t *testing.T) {
 	}
 	if cfg.JWTSecret != "test-secret" {
 		t.Fatalf("JWTSecret = %q, want %q", cfg.JWTSecret, "test-secret")
+	}
+	if cfg.LogLevel != "debug" {
+		t.Fatalf("LogLevel = %q, want %q", cfg.LogLevel, "debug")
 	}
 	if cfg.AccessTokenTTL != 12*time.Hour {
 		t.Fatalf("AccessTokenTTL = %v, want %v", cfg.AccessTokenTTL, 12*time.Hour)

@@ -615,6 +615,45 @@ func TestRoomWebSocketPassBroadcastsPublicEvent(t *testing.T) {
 	assertNoWSMessage(t, user3Conn)
 }
 
+func TestRoomWebSocketDisconnectMarksPlayerOffline(t *testing.T) {
+	setup := newThreePlayerRoom(t)
+	readyAllPlayers(t, setup)
+
+	server := httptest.NewServer(setup.Handler)
+	defer server.Close()
+
+	hostConn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.Host.Token)
+	defer hostConn.Close()
+	user2Conn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User2.Token)
+
+	if err := user2Conn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	var snapshot room.RoomSnapshot
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("did not receive offline snapshot in time")
+		}
+
+		envelope := readWSEnvelope(t, hostConn)
+		if envelope.Type != "room.snapshot" {
+			continue
+		}
+		if err := json.Unmarshal(envelope.Payload, &snapshot); err != nil {
+			t.Fatalf("unmarshal snapshot: %v", err)
+		}
+		if findPlayerStatus(snapshot.Players, setup.User2.ID) == "offline" {
+			break
+		}
+	}
+
+	if findPlayerStatus(snapshot.Players, setup.User2.ID) != "offline" {
+		t.Fatalf("player status = %q, want %q", findPlayerStatus(snapshot.Players, setup.User2.ID), "offline")
+	}
+}
+
 func createRoomViaAPI(t *testing.T, handler http.Handler, token string, payload string) roomAccessData {
 	t.Helper()
 
@@ -957,4 +996,13 @@ func buildRoomWSConnectURL(serverURL string, roomID string, token string) string
 
 func buildRoomWSBaseURL(serverURL string, roomID string) string {
 	return "ws" + strings.TrimPrefix(serverURL, "http") + "/ws/v1/rooms/" + roomID
+}
+
+func findPlayerStatus(players []room.RoomSnapshotPlayer, userID string) string {
+	for _, player := range players {
+		if player.UserID == userID {
+			return player.Status
+		}
+	}
+	return ""
 }

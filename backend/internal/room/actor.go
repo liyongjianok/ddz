@@ -21,19 +21,21 @@ const (
 	roomCommandTimeout    roomCommandType = "timeout"
 	roomCommandFillRobots roomCommandType = "fill_robots"
 	roomCommandRobotTurn  roomCommandType = "robot_turn"
+	roomCommandPresence   roomCommandType = "presence"
 	roomCommandSnapshot   roomCommandType = "snapshot"
 	roomCommandView       roomCommandType = "view"
 )
 
 type roomCommand struct {
-	typ           roomCommandType
-	userID        string
-	preferredSeat *int
-	ready         bool
-	score         int
-	cards         []game.Card
-	robotUserIDs  []string
-	response      chan roomCommandResult
+	typ            roomCommandType
+	userID         string
+	preferredSeat  *int
+	ready          bool
+	score          int
+	cards          []game.Card
+	robotUserIDs   []string
+	presenceOnline bool
+	response       chan roomCommandResult
 }
 
 type roomCommandResult struct {
@@ -162,6 +164,19 @@ func (a *RoomActor) HandleRobotTurn() (Room, TimeoutAction, error) {
 	return reply.room, reply.action, reply.err
 }
 
+// SetPlayerOnline 在房间命令队列中更新玩家在线状态。
+func (a *RoomActor) SetPlayerOnline(userID string, online bool) (Room, error) {
+	result := make(chan roomCommandResult, 1)
+	a.cmds <- roomCommand{
+		typ:            roomCommandPresence,
+		userID:         userID,
+		presenceOnline: online,
+		response:       result,
+	}
+	reply := <-result
+	return reply.room, reply.err
+}
+
 // Snapshot 返回房间当前只读快照。
 func (a *RoomActor) Snapshot() (Room, error) {
 	result := make(chan roomCommandResult, 1)
@@ -215,6 +230,8 @@ func (a *RoomActor) loop() {
 			result.room, result.started, result.err = a.handleFillRobots(cmd.robotUserIDs)
 		case roomCommandRobotTurn:
 			result.room, result.action, result.err = a.handleRobotTurn()
+		case roomCommandPresence:
+			result.room, result.err = a.handlePresence(cmd.userID, cmd.presenceOnline)
 		case roomCommandSnapshot:
 			result.room = a.room.Snapshot()
 		case roomCommandView:
@@ -458,6 +475,31 @@ func (a *RoomActor) handleRobotTurn() (Room, TimeoutAction, error) {
 	}
 
 	return a.applyAutoAction(seatIndex)
+}
+
+func (a *RoomActor) handlePresence(userID string, online bool) (Room, error) {
+	if a.room.CurrentGame == nil {
+		return a.room.Snapshot(), nil
+	}
+
+	for i := range a.room.CurrentGame.Players {
+		player := &a.room.CurrentGame.Players[i]
+		if player.UserID != userID {
+			continue
+		}
+		if player.IsRobot {
+			return a.room.Snapshot(), nil
+		}
+		if online {
+			player.Status = game.PlayerStatusPlaying
+		} else {
+			player.Status = game.PlayerStatusOffline
+		}
+		a.room.UpdatedAt = time.Now().UTC()
+		return a.room.Snapshot(), nil
+	}
+
+	return Room{}, ErrUserNotInRoom
 }
 
 func (a *RoomActor) applyAutoAction(seatIndex int) (Room, TimeoutAction, error) {

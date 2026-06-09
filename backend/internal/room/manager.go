@@ -490,6 +490,26 @@ func (m *Manager) HandleRobotTurn(roomID string) (*Room, TimeoutAction, error) {
 	return &room, action, nil
 }
 
+// SetPlayerOnline 更新玩家在指定房间中的在线状态。
+func (m *Manager) SetPlayerOnline(roomID string, userID string, online bool) (*Room, error) {
+	if roomID == "" || userID == "" {
+		return nil, ErrInvalidRoomConfig
+	}
+
+	m.mu.RLock()
+	actor, exists := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, ErrRoomNotFound
+	}
+
+	room, err := actor.SetPlayerOnline(userID, online)
+	if err != nil {
+		return nil, err
+	}
+	return &room, nil
+}
+
 // GetRoom 返回房间当前快照。
 func (m *Manager) GetRoom(roomID string) (*Room, error) {
 	if roomID == "" {

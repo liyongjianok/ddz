@@ -246,6 +246,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) register(client *clientConn) {
+	alreadyConnected := false
+
 	g.mu.Lock()
 	roomClients := g.rooms[client.roomID]
 	if roomClients == nil {
@@ -253,19 +255,48 @@ func (g *Gateway) register(client *clientConn) {
 		g.rooms[client.roomID] = roomClients
 	}
 	previous := roomClients[client.userID]
+	if previous != nil {
+		alreadyConnected = true
+	}
 	roomClients[client.userID] = client
 	g.mu.Unlock()
 
 	if previous != nil && previous != client {
 		previous.close()
 	}
+
+	if alreadyConnected {
+		if _, err := g.roomManager.SetPlayerOnline(client.roomID, client.userID, true); err == nil {
+			g.broadcastRoomSnapshots(client.roomID)
+		}
+		return
+	}
+
+	if _, err := g.roomManager.SetPlayerOnline(client.roomID, client.userID, true); err == nil {
+		roomSnapshot, snapshotErr := g.roomManager.GetRoomSnapshot(client.roomID, client.userID)
+		if snapshotErr == nil && roomSnapshot != nil && hasOfflinePlayer(roomSnapshot.Players) {
+			g.broadcastRoomSnapshots(client.roomID)
+		}
+	}
+}
+
+func hasOfflinePlayer(players []room.RoomSnapshotPlayer) bool {
+	for _, player := range players {
+		if player.Status == string(game.PlayerStatusOffline) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) unregister(client *clientConn) {
+	shouldMarkOffline := false
+
 	g.mu.Lock()
 	if roomClients, ok := g.rooms[client.roomID]; ok {
 		if current, exists := roomClients[client.userID]; exists && current == client {
 			delete(roomClients, client.userID)
+			shouldMarkOffline = true
 			if len(roomClients) == 0 {
 				delete(g.rooms, client.roomID)
 			}
@@ -274,6 +305,12 @@ func (g *Gateway) unregister(client *clientConn) {
 	g.mu.Unlock()
 
 	client.close()
+
+	if shouldMarkOffline {
+		if _, err := g.roomManager.SetPlayerOnline(client.roomID, client.userID, false); err == nil {
+			g.broadcastRoomSnapshots(client.roomID)
+		}
+	}
 }
 
 func (g *Gateway) roomClients(roomID string) []*clientConn {

@@ -451,6 +451,48 @@ func TestHandleRobotTurnNoopsForHumanTurn(t *testing.T) {
 	}
 }
 
+func TestSetPlayerOnlineUpdatesGamePlayerStatus(t *testing.T) {
+	manager := NewManagerWithRNG(&fixedRNG{value: 0})
+	room, _, err := manager.CreateRoom(CreateRoomInput{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	if _, _, err := manager.JoinRoom(JoinRoomInput{RoomID: room.ID, UserID: "u2"}); err != nil {
+		t.Fatalf("JoinRoom u2 error = %v", err)
+	}
+	if _, _, err := manager.JoinRoom(JoinRoomInput{RoomID: room.ID, UserID: "u3"}); err != nil {
+		t.Fatalf("JoinRoom u3 error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(ReadyInput{RoomID: room.ID, UserID: "u1", Ready: true}); err != nil {
+		t.Fatalf("Ready u1 error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(ReadyInput{RoomID: room.ID, UserID: "u2", Ready: true}); err != nil {
+		t.Fatalf("Ready u2 error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(ReadyInput{RoomID: room.ID, UserID: "u3", Ready: true}); err != nil {
+		t.Fatalf("Ready u3 error = %v", err)
+	}
+
+	updatedRoom, err := manager.SetPlayerOnline(room.ID, "u2", false)
+	if err != nil {
+		t.Fatalf("SetPlayerOnline(false) error = %v", err)
+	}
+	if updatedRoom.CurrentGame == nil {
+		t.Fatal("current game should not be nil")
+	}
+	if updatedRoom.CurrentGame.Players[1].Status != game.PlayerStatusOffline {
+		t.Fatalf("status = %q, want %q", updatedRoom.CurrentGame.Players[1].Status, game.PlayerStatusOffline)
+	}
+
+	updatedRoom, err = manager.SetPlayerOnline(room.ID, "u2", true)
+	if err != nil {
+		t.Fatalf("SetPlayerOnline(true) error = %v", err)
+	}
+	if updatedRoom.CurrentGame.Players[1].Status != game.PlayerStatusPlaying {
+		t.Fatalf("status = %q, want %q", updatedRoom.CurrentGame.Players[1].Status, game.PlayerStatusPlaying)
+	}
+}
+
 func TestReadyRejectsUserNotInRoom(t *testing.T) {
 	manager := NewManagerWithRNG(&fixedRNG{value: 0})
 	room, _, err := manager.CreateRoom(CreateRoomInput{UserID: "u1"})

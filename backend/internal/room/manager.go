@@ -127,6 +127,7 @@ type Manager struct {
 	rooms    map[string]*RoomActor
 	userRoom map[string]string
 	roomSeq  atomic.Uint64
+	robotSeq atomic.Uint64
 	rng      game.RNG
 }
 
@@ -428,6 +429,67 @@ func (m *Manager) HandleTimeout(roomID string) (*Room, TimeoutAction, error) {
 	return &room, action, nil
 }
 
+// FillRobots 为等待中的房间补齐机器人座位；机器人自动处于已准备状态。
+func (m *Manager) FillRobots(roomID string) (*Room, bool, error) {
+	if roomID == "" {
+		return nil, false, ErrInvalidRoomConfig
+	}
+
+	m.mu.Lock()
+	actor, exists := m.rooms[roomID]
+	if !exists {
+		m.mu.Unlock()
+		return nil, false, ErrRoomNotFound
+	}
+
+	robotUserIDs := make([]string, game.PlayerCount)
+	for i := range robotUserIDs {
+		robotUserIDs[i] = m.nextRobotID()
+	}
+
+	room, started, err := actor.FillRobots(robotUserIDs)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, false, err
+	}
+
+	generated := make(map[string]struct{}, len(robotUserIDs))
+	for _, userID := range robotUserIDs {
+		generated[userID] = struct{}{}
+	}
+	for _, seat := range room.Seats {
+		if !seat.IsRobot {
+			continue
+		}
+		if _, ok := generated[seat.UserID]; ok {
+			m.userRoom[seat.UserID] = room.ID
+		}
+	}
+	m.mu.Unlock()
+
+	return &room, started, nil
+}
+
+// HandleRobotTurn 让当前回合的机器人通过房间 Actor 执行一次合法动作。
+func (m *Manager) HandleRobotTurn(roomID string) (*Room, TimeoutAction, error) {
+	if roomID == "" {
+		return nil, TimeoutActionNone, ErrInvalidRoomConfig
+	}
+
+	m.mu.RLock()
+	actor, exists := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, TimeoutActionNone, ErrRoomNotFound
+	}
+
+	room, action, err := actor.HandleRobotTurn()
+	if err != nil {
+		return nil, TimeoutActionNone, err
+	}
+	return &room, action, nil
+}
+
 // GetRoom 返回房间当前快照。
 func (m *Manager) GetRoom(roomID string) (*Room, error) {
 	if roomID == "" {
@@ -468,6 +530,11 @@ func (m *Manager) GetRoomSnapshot(roomID string, userID string) (*RoomSnapshot, 
 func (m *Manager) nextRoomID() string {
 	seq := m.roomSeq.Add(1)
 	return fmt.Sprintf("r_%06d", seq)
+}
+
+func (m *Manager) nextRobotID() string {
+	seq := m.robotSeq.Add(1)
+	return fmt.Sprintf("robot_%06d", seq)
 }
 
 func validateCreateRoomInput(input CreateRoomInput) error {

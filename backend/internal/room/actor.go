@@ -12,15 +12,17 @@ var ErrRoomClosed = errors.New("room closed")
 type roomCommandType string
 
 const (
-	roomCommandJoin      roomCommandType = "join"
-	roomCommandLeave     roomCommandType = "leave"
-	roomCommandReady     roomCommandType = "ready"
-	roomCommandBid       roomCommandType = "bid"
-	roomCommandPlayCards roomCommandType = "play_cards"
-	roomCommandPass      roomCommandType = "pass"
-	roomCommandTimeout   roomCommandType = "timeout"
-	roomCommandSnapshot  roomCommandType = "snapshot"
-	roomCommandView      roomCommandType = "view"
+	roomCommandJoin       roomCommandType = "join"
+	roomCommandLeave      roomCommandType = "leave"
+	roomCommandReady      roomCommandType = "ready"
+	roomCommandBid        roomCommandType = "bid"
+	roomCommandPlayCards  roomCommandType = "play_cards"
+	roomCommandPass       roomCommandType = "pass"
+	roomCommandTimeout    roomCommandType = "timeout"
+	roomCommandFillRobots roomCommandType = "fill_robots"
+	roomCommandRobotTurn  roomCommandType = "robot_turn"
+	roomCommandSnapshot   roomCommandType = "snapshot"
+	roomCommandView       roomCommandType = "view"
 )
 
 type roomCommand struct {
@@ -30,6 +32,7 @@ type roomCommand struct {
 	ready         bool
 	score         int
 	cards         []game.Card
+	robotUserIDs  []string
 	response      chan roomCommandResult
 }
 
@@ -136,6 +139,29 @@ func (a *RoomActor) HandleTimeout() (Room, TimeoutAction, error) {
 	return reply.room, reply.action, reply.err
 }
 
+// FillRobots 在房间命令队列中补齐机器人座位。
+func (a *RoomActor) FillRobots(robotUserIDs []string) (Room, bool, error) {
+	result := make(chan roomCommandResult, 1)
+	a.cmds <- roomCommand{
+		typ:          roomCommandFillRobots,
+		robotUserIDs: append([]string(nil), robotUserIDs...),
+		response:     result,
+	}
+	reply := <-result
+	return reply.room, reply.started, reply.err
+}
+
+// HandleRobotTurn 在房间命令队列中执行一次机器人动作。
+func (a *RoomActor) HandleRobotTurn() (Room, TimeoutAction, error) {
+	result := make(chan roomCommandResult, 1)
+	a.cmds <- roomCommand{
+		typ:      roomCommandRobotTurn,
+		response: result,
+	}
+	reply := <-result
+	return reply.room, reply.action, reply.err
+}
+
 // Snapshot 返回房间当前只读快照。
 func (a *RoomActor) Snapshot() (Room, error) {
 	result := make(chan roomCommandResult, 1)
@@ -185,6 +211,10 @@ func (a *RoomActor) loop() {
 			result.room, result.err = a.handlePass(cmd.userID)
 		case roomCommandTimeout:
 			result.room, result.action, result.err = a.handleTimeout()
+		case roomCommandFillRobots:
+			result.room, result.started, result.err = a.handleFillRobots(cmd.robotUserIDs)
+		case roomCommandRobotTurn:
+			result.room, result.action, result.err = a.handleRobotTurn()
 		case roomCommandSnapshot:
 			result.room = a.room.Snapshot()
 		case roomCommandView:
@@ -368,6 +398,70 @@ func (a *RoomActor) handleTimeout() (Room, TimeoutAction, error) {
 		return Room{}, TimeoutActionNone, ErrInvalidRoomConfig
 	}
 
+	return a.applyAutoAction(seatIndex)
+}
+
+func (a *RoomActor) handleFillRobots(robotUserIDs []string) (Room, bool, error) {
+	if a.room.Status == RoomStatusClosed {
+		return Room{}, false, ErrRoomClosed
+	}
+	if a.room.Status != RoomStatusWaiting {
+		return a.room.Snapshot(), false, nil
+	}
+	if len(a.room.Seats) >= a.room.MaxPlayers {
+		return a.room.Snapshot(), false, nil
+	}
+
+	nextRobot := 0
+	now := time.Now().UTC()
+	for len(a.room.Seats) < a.room.MaxPlayers {
+		if nextRobot >= len(robotUserIDs) || robotUserIDs[nextRobot] == "" {
+			return Room{}, false, ErrInvalidRoomConfig
+		}
+
+		seatIndex, err := firstAvailableSeat(a.room, nil)
+		if err != nil {
+			return Room{}, false, err
+		}
+
+		a.room.Seats = append(a.room.Seats, Seat{
+			UserID:    robotUserIDs[nextRobot],
+			SeatIndex: seatIndex,
+			IsRobot:   true,
+			Ready:     true,
+			JoinedAt:  now,
+		})
+		nextRobot++
+	}
+	a.room.UpdatedAt = now
+
+	started, err := a.tryStartGame()
+	if err != nil {
+		return Room{}, false, err
+	}
+
+	return a.room.Snapshot(), started, nil
+}
+
+func (a *RoomActor) handleRobotTurn() (Room, TimeoutAction, error) {
+	if a.room.CurrentGame == nil {
+		return a.room.Snapshot(), TimeoutActionNone, nil
+	}
+
+	currentGame := a.room.CurrentGame
+	seatIndex := currentGame.CurrentSeatIndex
+	if seatIndex < 0 || seatIndex >= len(currentGame.Players) {
+		return Room{}, TimeoutActionNone, ErrInvalidRoomConfig
+	}
+	if !currentGame.Players[seatIndex].IsRobot {
+		return a.room.Snapshot(), TimeoutActionNone, nil
+	}
+
+	return a.applyAutoAction(seatIndex)
+}
+
+func (a *RoomActor) applyAutoAction(seatIndex int) (Room, TimeoutAction, error) {
+	currentGame := a.room.CurrentGame
 	switch currentGame.Phase {
 	case game.GamePhaseBidding:
 		if err := currentGame.PlaceBid(seatIndex, 0, a.rng); err != nil {

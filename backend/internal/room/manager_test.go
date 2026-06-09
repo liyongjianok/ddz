@@ -2,6 +2,7 @@ package room
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -308,6 +309,145 @@ func TestReadyStartsGameWhenRoomIsFullAndAllReady(t *testing.T) {
 	}
 	if len(updatedRoom.CurrentGame.Players) != game.PlayerCount {
 		t.Fatalf("player count = %d, want %d", len(updatedRoom.CurrentGame.Players), game.PlayerCount)
+	}
+}
+
+func TestFillRobotsStartsGameForSingleReadyPlayer(t *testing.T) {
+	manager := NewManagerWithRNG(&fixedRNG{value: 0})
+	room, _, err := manager.CreateRoom(CreateRoomInput{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(ReadyInput{RoomID: room.ID, UserID: "u1", Ready: true}); err != nil {
+		t.Fatalf("Ready() error = %v", err)
+	}
+
+	updatedRoom, started, err := manager.FillRobots(room.ID)
+	if err != nil {
+		t.Fatalf("FillRobots() error = %v", err)
+	}
+	if !started {
+		t.Fatal("room should start after robots fill empty seats")
+	}
+	if updatedRoom.Status != RoomStatusPlaying {
+		t.Fatalf("room status = %q, want %q", updatedRoom.Status, RoomStatusPlaying)
+	}
+	if len(updatedRoom.Seats) != game.PlayerCount {
+		t.Fatalf("seat count = %d, want %d", len(updatedRoom.Seats), game.PlayerCount)
+	}
+
+	robotCount := 0
+	for _, seat := range updatedRoom.Seats {
+		if !seat.Ready {
+			t.Fatalf("seat %d should be ready", seat.SeatIndex)
+		}
+		if seat.IsRobot {
+			robotCount++
+			if !strings.HasPrefix(seat.UserID, "robot_") {
+				t.Fatalf("robot user id = %q, want robot_ prefix", seat.UserID)
+			}
+		}
+	}
+	if robotCount != 2 {
+		t.Fatalf("robot count = %d, want 2", robotCount)
+	}
+	if updatedRoom.CurrentGame == nil {
+		t.Fatal("current game should be created")
+	}
+	for _, player := range updatedRoom.CurrentGame.Players {
+		if strings.HasPrefix(player.UserID, "robot_") && !player.IsRobot {
+			t.Fatalf("game player %q should be marked as robot", player.UserID)
+		}
+	}
+}
+
+func TestFillRobotsIsNoopAfterRoomStarted(t *testing.T) {
+	manager := NewManagerWithRNG(&fixedRNG{value: 0})
+	room, _, err := manager.CreateRoom(CreateRoomInput{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(ReadyInput{RoomID: room.ID, UserID: "u1", Ready: true}); err != nil {
+		t.Fatalf("Ready() error = %v", err)
+	}
+	if _, started, err := manager.FillRobots(room.ID); err != nil {
+		t.Fatalf("FillRobots() error = %v", err)
+	} else if !started {
+		t.Fatal("room should start after first FillRobots()")
+	}
+
+	updatedRoom, started, err := manager.FillRobots(room.ID)
+	if err != nil {
+		t.Fatalf("second FillRobots() error = %v", err)
+	}
+	if started {
+		t.Fatal("second FillRobots() should not report a new start")
+	}
+	if len(updatedRoom.Seats) != game.PlayerCount {
+		t.Fatalf("seat count = %d, want %d", len(updatedRoom.Seats), game.PlayerCount)
+	}
+}
+
+func TestHandleRobotTurnUsesLegalAutoAction(t *testing.T) {
+	manager := NewManagerWithRNG(&fixedRNG{value: 1})
+	room, _, err := manager.CreateRoom(CreateRoomInput{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(ReadyInput{RoomID: room.ID, UserID: "u1", Ready: true}); err != nil {
+		t.Fatalf("Ready() error = %v", err)
+	}
+	startedRoom, started, err := manager.FillRobots(room.ID)
+	if err != nil {
+		t.Fatalf("FillRobots() error = %v", err)
+	}
+	if !started {
+		t.Fatal("room should start")
+	}
+	currentSeat := startedRoom.CurrentGame.CurrentSeatIndex
+	if !startedRoom.CurrentGame.Players[currentSeat].IsRobot {
+		t.Fatalf("current seat %d should be robot for this test", currentSeat)
+	}
+
+	updatedRoom, action, err := manager.HandleRobotTurn(room.ID)
+	if err != nil {
+		t.Fatalf("HandleRobotTurn() error = %v", err)
+	}
+	if action != TimeoutActionAutoBid {
+		t.Fatalf("action = %q, want %q", action, TimeoutActionAutoBid)
+	}
+	if len(updatedRoom.CurrentGame.BiddingState.Bids) != 1 {
+		t.Fatalf("bid count = %d, want 1", len(updatedRoom.CurrentGame.BiddingState.Bids))
+	}
+	if updatedRoom.CurrentGame.BiddingState.Bids[0].SeatIndex != currentSeat {
+		t.Fatalf("bid seat = %d, want %d", updatedRoom.CurrentGame.BiddingState.Bids[0].SeatIndex, currentSeat)
+	}
+}
+
+func TestHandleRobotTurnNoopsForHumanTurn(t *testing.T) {
+	manager := NewManagerWithRNG(&fixedRNG{value: 0})
+	room, _, err := manager.CreateRoom(CreateRoomInput{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	if _, _, _, err := manager.Ready(ReadyInput{RoomID: room.ID, UserID: "u1", Ready: true}); err != nil {
+		t.Fatalf("Ready() error = %v", err)
+	}
+	if _, started, err := manager.FillRobots(room.ID); err != nil {
+		t.Fatalf("FillRobots() error = %v", err)
+	} else if !started {
+		t.Fatal("room should start")
+	}
+
+	updatedRoom, action, err := manager.HandleRobotTurn(room.ID)
+	if err != nil {
+		t.Fatalf("HandleRobotTurn() error = %v", err)
+	}
+	if action != TimeoutActionNone {
+		t.Fatalf("action = %q, want %q", action, TimeoutActionNone)
+	}
+	if len(updatedRoom.CurrentGame.BiddingState.Bids) != 0 {
+		t.Fatalf("bid count = %d, want 0", len(updatedRoom.CurrentGame.BiddingState.Bids))
 	}
 }
 

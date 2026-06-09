@@ -25,6 +25,8 @@ const (
 	defaultPingPeriod           = 30 * time.Second
 	defaultSendBufferSize       = 16
 	roomRoutePrefix             = "/ws/v1/rooms/"
+	robotFillDelay              = 800 * time.Millisecond
+	robotActionDelay            = 800 * time.Millisecond
 )
 
 var errConnectionClosed = errors.New("websocket connection closed")
@@ -324,6 +326,40 @@ func (g *Gateway) broadcastRoomSnapshots(roomID string) {
 	}
 }
 
+func (g *Gateway) scheduleRobotFill(roomID string) {
+	go func() {
+		time.Sleep(robotFillDelay)
+
+		currentRoom, started, err := g.roomManager.FillRobots(roomID)
+		if err != nil || currentRoom == nil {
+			return
+		}
+
+		g.broadcastRoomSnapshots(roomID)
+		if started {
+			g.scheduleRobotTurn(roomID)
+		}
+	}()
+}
+
+func (g *Gateway) scheduleRobotTurn(roomID string) {
+	go func() {
+		time.Sleep(robotActionDelay)
+
+		currentRoom, action, err := g.roomManager.HandleRobotTurn(roomID)
+		if err != nil || currentRoom == nil || action == room.TimeoutActionNone {
+			return
+		}
+
+		g.broadcastRoomSnapshots(roomID)
+		if currentRoom.CurrentGame != nil && currentRoom.CurrentGame.Phase == game.GamePhaseEnded {
+			g.broadcastGameEnded(currentRoom, nil)
+			return
+		}
+		g.scheduleRobotTurn(roomID)
+	}()
+}
+
 func (c *clientConn) readLoop() {
 	defer c.gateway.unregister(c)
 
@@ -487,6 +523,9 @@ func (c *clientConn) handleReady(message clientMessage) error {
 	})
 	if started && currentRoom != nil {
 		c.gateway.broadcastRoomSnapshots(c.roomID)
+		c.gateway.scheduleRobotTurn(c.roomID)
+	} else if payload.Ready && currentRoom != nil && currentRoom.Status == room.RoomStatusWaiting {
+		c.gateway.scheduleRobotFill(c.roomID)
 	}
 
 	return nil
@@ -540,6 +579,7 @@ func (c *clientConn) handleBid(message clientMessage) error {
 		c.gateway.sendHandUpdated(c.roomID, landlordPlayer.UserID, message.RequestID)
 	}
 
+	c.gateway.scheduleRobotTurn(c.roomID)
 	return nil
 }
 
@@ -590,8 +630,10 @@ func (c *clientConn) handlePlayCards(message clientMessage) error {
 
 	if currentRoom.CurrentGame.Phase == game.GamePhaseEnded || currentRoom.Status == room.RoomStatusSettling {
 		c.gateway.broadcastGameEnded(currentRoom, message.RequestID)
+		return nil
 	}
 
+	c.gateway.scheduleRobotTurn(c.roomID)
 	return nil
 }
 
@@ -627,6 +669,7 @@ func (c *clientConn) handlePass(message clientMessage) error {
 		DeadlineAt:    currentRoom.DeadlineAt,
 	})
 
+	c.gateway.scheduleRobotTurn(c.roomID)
 	return nil
 }
 

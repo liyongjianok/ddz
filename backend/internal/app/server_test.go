@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"ddz/backend/internal/game"
+	"ddz/backend/internal/record"
 	"ddz/backend/internal/room"
 )
 
@@ -79,6 +82,32 @@ type roomAccessData struct {
 type leaveRoomData struct {
 	RoomID string `json:"room_id"`
 	Left   bool   `json:"left"`
+}
+
+type recordListData struct {
+	Items []struct {
+		GameID     string    `json:"game_id"`
+		Mode       string    `json:"mode"`
+		Role       string    `json:"role"`
+		WinnerSide string    `json:"winner_side"`
+		ScoreDelta int       `json:"score_delta"`
+		StartedAt  time.Time `json:"started_at"`
+		EndedAt    time.Time `json:"ended_at"`
+	} `json:"items"`
+	Page     int `json:"page"`
+	PageSize int `json:"page_size"`
+	Total    int `json:"total"`
+}
+
+type recordDetailData struct {
+	GameID     string                `json:"game_id"`
+	RoomID     string                `json:"room_id"`
+	Mode       string                `json:"mode"`
+	BaseScore  int                   `json:"base_score"`
+	Multiplier int                   `json:"multiplier"`
+	WinnerSide string                `json:"winner_side"`
+	Players    []record.RecordPlayer `json:"players"`
+	Events     []record.Event        `json:"events"`
 }
 
 func TestHealthzReturnsOK(t *testing.T) {
@@ -499,6 +528,111 @@ func TestJoinRoomRejectsRoomNotFound(t *testing.T) {
 	}
 }
 
+func TestMyRecordsReturnsCompletedGames(t *testing.T) {
+	recordService := record.NewService(record.NewMemoryStore())
+	handler := NewHTTPHandlerWithDependencies(testConfig(), room.NewManager(), recordService)
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+	user := currentUserWithToken(t, handler, token)
+
+	err := recordService.AppendEvent(nilContext(), record.Event{
+		GameID:      "g_001",
+		RoomID:      "r_001",
+		Seq:         1,
+		EventType:   "game_ended",
+		ActorUserID: user.ID,
+		Payload:     map[string]any{"winner_side": "landlord"},
+		CreatedAt:   time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("AppendEvent() error = %v", err)
+	}
+	err = recordService.SaveGameRecord(nilContext(), &room.Room{
+		ID:        "r_001",
+		Mode:      "classic",
+		BaseScore: 1,
+		CurrentGame: &game.Game{
+			ID:        "g_001",
+			StartedAt: time.Now().UTC().Add(-time.Minute),
+			EndedAt:   time.Now().UTC(),
+			Players: []game.PlayerState{
+				{UserID: user.ID, SeatIndex: 0, Role: game.RoleLandlord},
+				{UserID: "u2", SeatIndex: 1, Role: game.RoleFarmer},
+				{UserID: "u3", SeatIndex: 2, Role: game.RoleFarmer},
+			},
+			Settlement: &game.SettlementResult{
+				BaseScore:  1,
+				Multiplier: 3,
+				WinnerSide: game.WinnerSideLandlord,
+				Players: []game.SettlementPlayer{
+					{UserID: user.ID, SeatIndex: 0, Role: game.RoleLandlord, DeltaScore: 6, IsWinner: true},
+					{UserID: "u2", SeatIndex: 1, Role: game.RoleFarmer, DeltaScore: -3},
+					{UserID: "u3", SeatIndex: 2, Role: game.RoleFarmer, DeltaScore: -3},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SaveGameRecord() error = %v", err)
+	}
+
+	rec := doAuthenticatedJSONRequest(t, handler, http.MethodGet, "/api/v1/records/my?page=1&page_size=20", token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var data recordListData
+	decodeResponseData(t, decodeResponseEnvelope(t, rec), &data)
+	if data.Total != 1 {
+		t.Fatalf("total = %d, want 1", data.Total)
+	}
+	if len(data.Items) != 1 {
+		t.Fatalf("items len = %d, want 1", len(data.Items))
+	}
+	if data.Items[0].GameID != "g_001" {
+		t.Fatalf("game_id = %q, want %q", data.Items[0].GameID, "g_001")
+	}
+}
+
+func TestRecordDetailRejectsNonParticipant(t *testing.T) {
+	recordService := record.NewService(record.NewMemoryStore())
+	handler := NewHTTPHandlerWithDependencies(testConfig(), room.NewManager(), recordService)
+	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
+
+	err := recordService.SaveGameRecord(nilContext(), &room.Room{
+		ID:        "r_001",
+		Mode:      "classic",
+		BaseScore: 1,
+		CurrentGame: &game.Game{
+			ID:        "g_001",
+			StartedAt: time.Now().UTC().Add(-time.Minute),
+			EndedAt:   time.Now().UTC(),
+			Players: []game.PlayerState{
+				{UserID: "u1", SeatIndex: 0, Role: game.RoleLandlord},
+				{UserID: "u2", SeatIndex: 1, Role: game.RoleFarmer},
+				{UserID: "u3", SeatIndex: 2, Role: game.RoleFarmer},
+			},
+			Settlement: &game.SettlementResult{
+				BaseScore:  1,
+				Multiplier: 3,
+				WinnerSide: game.WinnerSideLandlord,
+				Players: []game.SettlementPlayer{
+					{UserID: "u1", SeatIndex: 0, Role: game.RoleLandlord, DeltaScore: 6, IsWinner: true},
+					{UserID: "u2", SeatIndex: 1, Role: game.RoleFarmer, DeltaScore: -3},
+					{UserID: "u3", SeatIndex: 2, Role: game.RoleFarmer, DeltaScore: -3},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SaveGameRecord() error = %v", err)
+	}
+
+	rec := doAuthenticatedJSONRequest(t, handler, http.MethodGet, "/api/v1/records/g_001", token, "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+}
+
 func TestCreateRoomRejectsAlreadyInRoom(t *testing.T) {
 	handler := NewHTTPHandlerWithManager(testConfig(), room.NewManagerWithRNG(&fixedRoomRNG{value: 0}))
 	token := loginAndGetToken(t, handler, `{"display_name":"A"}`)
@@ -517,6 +651,10 @@ func TestCreateRoomRejectsAlreadyInRoom(t *testing.T) {
 	if envelope.Code != "already_in_room" {
 		t.Fatalf("code = %q, want %q", envelope.Code, "already_in_room")
 	}
+}
+
+func nilContext() context.Context {
+	return context.Background()
 }
 
 func loginAndGetToken(t *testing.T, handler http.Handler, payload string) string {

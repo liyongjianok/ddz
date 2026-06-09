@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"ddz/backend/internal/auth"
+	"ddz/backend/internal/record"
 	"ddz/backend/internal/room"
 	"ddz/backend/internal/ws"
 )
@@ -65,10 +66,16 @@ type leaveRoomResponseData struct {
 	Left   bool   `json:"left"`
 }
 
+type recordsQuery struct {
+	Page     int
+	PageSize int
+}
+
 type httpApp struct {
 	authService    *auth.Service
 	authMiddleware *auth.Middleware
 	roomManager    *room.Manager
+	recordService  *record.Service
 }
 
 func NewHTTPServer(cfg Config) *http.Server {
@@ -79,11 +86,24 @@ func NewHTTPServer(cfg Config) *http.Server {
 }
 
 func NewHTTPHandler(cfg Config) http.Handler {
-	return NewHTTPHandlerWithManager(cfg, room.NewManager())
+	return NewHTTPHandlerWithDependencies(
+		cfg,
+		room.NewManager(),
+		record.NewService(NewRecordStore(cfg, NewRedisStore(cfg))),
+	)
 }
 
-// NewHTTPHandlerWithManager 创建带指定房间管理器的 HTTP Handler，便于测试和后续复用。
+// NewHTTPHandlerWithManager 创建带指定房间管理器的 HTTP Handler，便于测试和复用。
 func NewHTTPHandlerWithManager(cfg Config, roomManager *room.Manager) http.Handler {
+	return NewHTTPHandlerWithDependencies(
+		cfg,
+		roomManager,
+		record.NewService(NewRecordStore(cfg, NewRedisStore(cfg))),
+	)
+}
+
+// NewHTTPHandlerWithDependencies 创建带显式依赖的 HTTP Handler。
+func NewHTTPHandlerWithDependencies(cfg Config, roomManager *room.Manager, recordService *record.Service) http.Handler {
 	jwtManager, err := auth.NewJWTManager(cfg.JWTSecret, cfg.AccessTokenTTL)
 	if err != nil {
 		panic(err)
@@ -91,13 +111,17 @@ func NewHTTPHandlerWithManager(cfg Config, roomManager *room.Manager) http.Handl
 	if roomManager == nil {
 		roomManager = room.NewManager()
 	}
+	if recordService == nil {
+		recordService = record.NewService(NewRecordStore(cfg, NewRedisStore(cfg)))
+	}
 
 	app := &httpApp{
 		authService:    auth.NewService(jwtManager),
 		authMiddleware: auth.NewMiddleware(jwtManager),
 		roomManager:    roomManager,
+		recordService:  recordService,
 	}
-	wsGateway := ws.NewGateway(jwtManager, roomManager)
+	wsGateway := ws.NewGateway(jwtManager, roomManager, recordService)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
@@ -105,6 +129,8 @@ func NewHTTPHandlerWithManager(cfg Config, roomManager *room.Manager) http.Handl
 	mux.Handle("/api/v1/auth/me", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleCurrentUser)))
 	mux.Handle("/api/v1/lobby/summary", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleLobbySummary)))
 	mux.Handle("/api/v1/matchmaking/quick-start", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleQuickStart)))
+	mux.Handle("/api/v1/records/my", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleMyRecords)))
+	mux.Handle("/api/v1/records/", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleRecordDetail)))
 	mux.Handle("/api/v1/rooms", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleRooms)))
 	mux.Handle("/api/v1/rooms/", app.authMiddleware.RequireAuth(http.HandlerFunc(app.handleRoomActions)))
 	mux.Handle("/ws/v1/rooms/", wsGateway)
@@ -378,6 +404,70 @@ func (a *httpApp) handleLeaveRoom(w http.ResponseWriter, r *http.Request, roomID
 	})
 }
 
+func (a *httpApp) handleMyRecords(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
+		return
+	}
+
+	userID, ok := authenticatedUserID(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "unauthorized")
+		return
+	}
+
+	query, err := parseRecordsQuery(r)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "bad_request", "bad request")
+		return
+	}
+
+	result, err := a.recordService.ListMyRecords(r.Context(), userID, query.Page, query.PageSize)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:      "ok",
+		Message:   "ok",
+		Data:      result,
+		RequestID: requestIDFromRequest(r),
+	})
+}
+
+func (a *httpApp) handleRecordDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
+		return
+	}
+
+	userID, ok := authenticatedUserID(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "unauthorized")
+		return
+	}
+
+	gameID, ok := parseRecordGameID(r.URL.Path)
+	if !ok {
+		writeError(w, r, http.StatusNotFound, "not_found", "not found")
+		return
+	}
+
+	result, err := a.recordService.GetGameRecord(r.Context(), userID, gameID)
+	if err != nil {
+		writeRecordError(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Code:      "ok",
+		Message:   "ok",
+		Data:      result,
+		RequestID: requestIDFromRequest(r),
+	})
+}
+
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -467,6 +557,24 @@ func parseOptionalPositiveInt(value string) (int, error) {
 	return parsed, nil
 }
 
+func parseRecordsQuery(r *http.Request) (recordsQuery, error) {
+	query := r.URL.Query()
+
+	page, err := parseOptionalPositiveInt(query.Get("page"))
+	if err != nil {
+		return recordsQuery{}, err
+	}
+	pageSize, err := parseOptionalPositiveInt(query.Get("page_size"))
+	if err != nil {
+		return recordsQuery{}, err
+	}
+
+	return recordsQuery{
+		Page:     page,
+		PageSize: pageSize,
+	}, nil
+}
+
 func parseRoomStatus(value string) (room.RoomStatus, bool) {
 	switch room.RoomStatus(value) {
 	case room.RoomStatusWaiting, room.RoomStatusPlaying, room.RoomStatusSettling, room.RoomStatusClosed:
@@ -498,6 +606,19 @@ func parseRoomActionPath(path string) (string, string, bool) {
 	return parts[0], parts[1], true
 }
 
+func parseRecordGameID(path string) (string, bool) {
+	const prefix = "/api/v1/records/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+
+	gameID := strings.Trim(strings.TrimPrefix(path, prefix), "/")
+	if gameID == "" || gameID == "my" || strings.Contains(gameID, "/") {
+		return "", false
+	}
+	return gameID, true
+}
+
 func buildRoomWSURL(roomID string) string {
 	return "/ws/v1/rooms/" + roomID
 }
@@ -523,6 +644,22 @@ func mapRoomError(err error) (int, string, string) {
 		return http.StatusBadRequest, "not_in_room", "not in room"
 	case errors.Is(err, room.ErrRoomFull):
 		return http.StatusConflict, "bad_request", "room full"
+	default:
+		return http.StatusInternalServerError, "internal_error", "internal error"
+	}
+}
+
+func writeRecordError(w http.ResponseWriter, r *http.Request, err error) {
+	statusCode, code, message := mapRecordError(err)
+	writeError(w, r, statusCode, code, message)
+}
+
+func mapRecordError(err error) (int, string, string) {
+	switch {
+	case errors.Is(err, record.ErrRecordNotFound):
+		return http.StatusNotFound, "not_found", "not found"
+	case errors.Is(err, record.ErrRecordForbidden):
+		return http.StatusForbidden, "forbidden", "forbidden"
 	default:
 		return http.StatusInternalServerError, "internal_error", "internal error"
 	}

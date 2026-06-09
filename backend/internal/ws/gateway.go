@@ -2,6 +2,7 @@ package ws
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"ddz/backend/internal/auth"
 	"ddz/backend/internal/game"
+	"ddz/backend/internal/record"
 	"ddz/backend/internal/room"
 
 	"github.com/gorilla/websocket"
@@ -148,6 +150,7 @@ type gameEndedSettlementEvent struct {
 type Gateway struct {
 	jwt         *auth.JWTManager
 	roomManager *room.Manager
+	recordSvc   *record.Service
 	upgrader    websocket.Upgrader
 	now         func() time.Time
 
@@ -169,10 +172,11 @@ type clientConn struct {
 }
 
 // NewGateway 创建房间 WebSocket 网关。
-func NewGateway(jwt *auth.JWTManager, roomManager *room.Manager) *Gateway {
+func NewGateway(jwt *auth.JWTManager, roomManager *room.Manager, recordSvc *record.Service) *Gateway {
 	return &Gateway{
 		jwt:         jwt,
 		roomManager: roomManager,
+		recordSvc:   recordSvc,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool {
 				return true
@@ -376,11 +380,13 @@ func (g *Gateway) scheduleRobotTurn(roomID string) {
 	go func() {
 		time.Sleep(robotActionDelay)
 
+		beforeRoom, _ := g.roomManager.GetRoom(roomID)
 		currentRoom, action, err := g.roomManager.HandleRobotTurn(roomID)
 		if err != nil || currentRoom == nil || action == room.TimeoutActionNone {
 			return
 		}
 
+		g.persistAutoAction(beforeRoom, currentRoom, action)
 		g.broadcastRoomSnapshots(roomID)
 		if currentRoom.CurrentGame != nil && currentRoom.CurrentGame.Phase == game.GamePhaseEnded {
 			g.broadcastGameEnded(currentRoom, nil)
@@ -587,6 +593,7 @@ func (c *clientConn) handleBid(message clientMessage) error {
 	if !ok {
 		return nil
 	}
+	c.gateway.appendBidEvent(currentRoom, c.userID, seatIndex, payload.Score)
 	c.gateway.broadcast(c.roomID, "game.bid_placed", message.RequestID, gameBidPlacedEvent{
 		UserID:        c.userID,
 		SeatIndex:     seatIndex,
@@ -642,6 +649,7 @@ func (c *clientConn) handlePlayCards(message clientMessage) error {
 
 	lastPlay := currentRoom.CurrentGame.LastPlay
 	remainingCount, _ := findRemainingCountByUserID(currentRoom.CurrentGame.Players, c.userID)
+	c.gateway.appendPlayEvent(currentRoom, c.userID, lastPlay, remainingCount)
 	c.gateway.broadcast(c.roomID, "game.cards_played", message.RequestID, gameCardsPlayedEvent{
 		UserID:    c.userID,
 		SeatIndex: lastPlay.SeatIndex,
@@ -692,6 +700,7 @@ func (c *clientConn) handlePass(message clientMessage) error {
 	if !ok {
 		return nil
 	}
+	c.gateway.appendPassEvent(currentRoom, c.userID, seatIndex)
 	c.gateway.broadcast(c.roomID, "game.player_passed", message.RequestID, gamePlayerPassedEvent{
 		UserID:        c.userID,
 		SeatIndex:     seatIndex,
@@ -798,6 +807,78 @@ func mapActionError(err error) (string, string) {
 		return "invalid_card_set", "invalid card set"
 	default:
 		return "internal_error", "internal error"
+	}
+}
+
+func (g *Gateway) appendBidEvent(currentRoom *room.Room, actorUserID string, seatIndex int, score int) {
+	if g.recordSvc == nil || currentRoom == nil || currentRoom.CurrentGame == nil {
+		return
+	}
+	_ = g.recordSvc.AppendEvent(context.Background(), record.BuildEventFromBid(currentRoom, actorUserID, seatIndex, score))
+}
+
+func (g *Gateway) appendPlayEvent(currentRoom *room.Room, actorUserID string, lastPlay *game.Play, remainingCount int) {
+	if g.recordSvc == nil || currentRoom == nil || currentRoom.CurrentGame == nil || lastPlay == nil {
+		return
+	}
+	_ = g.recordSvc.AppendEvent(context.Background(), record.BuildEventFromPlay(currentRoom, actorUserID, lastPlay, remainingCount))
+	if currentRoom.CurrentGame.Phase == game.GamePhaseEnded || currentRoom.Status == room.RoomStatusSettling {
+		g.finalizeGameRecord(currentRoom)
+	}
+}
+
+func (g *Gateway) appendPassEvent(currentRoom *room.Room, actorUserID string, seatIndex int) {
+	if g.recordSvc == nil || currentRoom == nil || currentRoom.CurrentGame == nil {
+		return
+	}
+	_ = g.recordSvc.AppendEvent(context.Background(), record.BuildEventFromPass(currentRoom, actorUserID, seatIndex))
+}
+
+func (g *Gateway) finalizeGameRecord(currentRoom *room.Room) {
+	if g.recordSvc == nil || currentRoom == nil || currentRoom.CurrentGame == nil || currentRoom.CurrentGame.Settlement == nil {
+		return
+	}
+	_ = g.recordSvc.AppendEvent(context.Background(), record.BuildEventFromSettlement(currentRoom))
+	_ = g.recordSvc.SaveGameRecord(context.Background(), currentRoom)
+}
+
+func (g *Gateway) persistAutoAction(beforeRoom *room.Room, currentRoom *room.Room, action room.TimeoutAction) {
+	if g.recordSvc == nil || currentRoom == nil || currentRoom.CurrentGame == nil {
+		return
+	}
+
+	switch action {
+	case room.TimeoutActionAutoBid:
+		if beforeRoom == nil || beforeRoom.CurrentGame == nil {
+			return
+		}
+		seatIndex := beforeRoom.CurrentGame.CurrentSeatIndex
+		if seatIndex < 0 || seatIndex >= len(beforeRoom.CurrentGame.Players) {
+			return
+		}
+		actor := beforeRoom.CurrentGame.Players[seatIndex]
+		bids := currentRoom.CurrentGame.BiddingState.Bids
+		if len(bids) == 0 {
+			return
+		}
+		lastBid := bids[len(bids)-1]
+		g.appendBidEvent(currentRoom, actor.UserID, lastBid.SeatIndex, lastBid.Score)
+	case room.TimeoutActionAutoPlay:
+		lastPlay := currentRoom.CurrentGame.LastPlay
+		if lastPlay == nil {
+			return
+		}
+		remainingCount, _ := findRemainingCountByUserID(currentRoom.CurrentGame.Players, lastPlay.UserID)
+		g.appendPlayEvent(currentRoom, lastPlay.UserID, lastPlay, remainingCount)
+	case room.TimeoutActionAutoPass:
+		if beforeRoom == nil || beforeRoom.CurrentGame == nil {
+			return
+		}
+		seatIndex := beforeRoom.CurrentGame.CurrentSeatIndex
+		if seatIndex < 0 || seatIndex >= len(beforeRoom.CurrentGame.Players) {
+			return
+		}
+		g.appendPassEvent(currentRoom, beforeRoom.CurrentGame.Players[seatIndex].UserID, seatIndex)
 	}
 }
 

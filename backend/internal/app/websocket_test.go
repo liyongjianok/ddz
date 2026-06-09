@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"ddz/backend/internal/game"
+	"ddz/backend/internal/record"
 	"ddz/backend/internal/room"
 
 	"github.com/gorilla/websocket"
@@ -696,6 +697,109 @@ func TestRoomWebSocketReconnectRestoresPrivateSnapshotAndOnlineStatus(t *testing
 	}
 
 	waitForPlayerStatusSnapshot(t, hostConn, setup.User2.ID, "playing")
+}
+
+func TestCompletedGameCanBeQueriedFromRecordAPI(t *testing.T) {
+	manager := room.NewManagerWithRNG(&fixedRoomRNG{value: 0})
+	recordService := record.NewService(record.NewMemoryStore())
+	handler := NewHTTPHandlerWithDependencies(testConfig(), manager, recordService)
+
+	hostToken := loginAndGetToken(t, handler, `{"display_name":"Host"}`)
+	user2Token := loginAndGetToken(t, handler, `{"display_name":"User2"}`)
+	user3Token := loginAndGetToken(t, handler, `{"display_name":"User3"}`)
+
+	host := currentUserWithToken(t, handler, hostToken)
+	user2 := currentUserWithToken(t, handler, user2Token)
+	user3 := currentUserWithToken(t, handler, user3Token)
+
+	access := createRoomViaAPI(t, handler, hostToken, `{"mode":"classic","base_score":1,"private":false}`)
+	_ = doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms/"+access.RoomID+"/join", user2Token, `{"preferred_seat":1}`)
+	_ = doAuthenticatedJSONRequest(t, handler, http.MethodPost, "/api/v1/rooms/"+access.RoomID+"/join", user3Token, `{"preferred_seat":2}`)
+
+	users := []string{host.ID, user2.ID, user3.ID}
+	for _, userID := range users {
+		if _, _, _, err := manager.Ready(room.ReadyInput{RoomID: access.RoomID, UserID: userID, Ready: true}); err != nil {
+			t.Fatalf("Ready(%s) error = %v", userID, err)
+		}
+	}
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	hostConn, _ := connectRoomWebSocket(t, server.URL, access.RoomID, hostToken)
+	defer hostConn.Close()
+
+	sendWSJSON(t, hostConn, map[string]any{
+		"type":       "game.bid",
+		"request_id": "req_record_bid",
+		"seq":        1,
+		"payload": map[string]any{
+			"score": 3,
+		},
+	})
+	assertWSAck(t, readWSEnvelope(t, hostConn), "req_record_bid")
+	_ = readWSEnvelope(t, hostConn)
+	_ = readWSEnvelope(t, hostConn)
+	_ = readWSEnvelope(t, hostConn)
+
+	currentRoom, err := manager.GetRoom(access.RoomID)
+	if err != nil {
+		t.Fatalf("GetRoom() error = %v", err)
+	}
+	if currentRoom.CurrentGame == nil || len(currentRoom.CurrentGame.Players[0].Hand) == 0 {
+		t.Fatal("host game hand should not be empty")
+	}
+	winningCard := currentRoom.CurrentGame.Players[0].Hand[0]
+	currentRoom.CurrentGame.Players[0].Hand = []game.Card{winningCard}
+	currentRoom.CurrentGame.Players[0].RemainingCount = 1
+	currentRoom.CurrentGame.CurrentSeatIndex = 0
+	currentRoom.CurrentGame.LastPlay = nil
+
+	sendWSJSON(t, hostConn, map[string]any{
+		"type":       "game.play_cards",
+		"request_id": "req_record_play",
+		"seq":        2,
+		"payload": map[string]any{
+			"cards": []string{winningCard.Code()},
+		},
+	})
+
+	assertWSAck(t, readWSEnvelope(t, hostConn), "req_record_play")
+	deadline := time.Now().Add(2 * time.Second)
+	var ended bool
+	for time.Now().Before(deadline) {
+		envelope := readWSEnvelope(t, hostConn)
+		if envelope.Type == "game.ended" {
+			ended = true
+			break
+		}
+	}
+	if !ended {
+		t.Fatal("did not receive game.ended event")
+	}
+
+	listRec := doAuthenticatedJSONRequest(t, handler, http.MethodGet, "/api/v1/records/my?page=1&page_size=20", hostToken, "")
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d", listRec.Code, http.StatusOK)
+	}
+	var listData recordListData
+	decodeResponseData(t, decodeResponseEnvelope(t, listRec), &listData)
+	if listData.Total != 1 {
+		t.Fatalf("total = %d, want 1", listData.Total)
+	}
+
+	detailRec := doAuthenticatedJSONRequest(t, handler, http.MethodGet, "/api/v1/records/g_"+access.RoomID, hostToken, "")
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d", detailRec.Code, http.StatusOK)
+	}
+	var detailData recordDetailData
+	decodeResponseData(t, decodeResponseEnvelope(t, detailRec), &detailData)
+	if detailData.GameID != "g_"+access.RoomID {
+		t.Fatalf("game_id = %q, want %q", detailData.GameID, "g_"+access.RoomID)
+	}
+	if len(detailData.Events) < 2 {
+		t.Fatalf("events len = %d, want >= 2", len(detailData.Events))
+	}
 }
 
 func createRoomViaAPI(t *testing.T, handler http.Handler, token string, payload string) roomAccessData {

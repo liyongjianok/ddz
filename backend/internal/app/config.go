@@ -10,21 +10,26 @@ const (
 	defaultHTTPAddr       = ":8080"
 	defaultJWTSecret      = "change-me"
 	defaultAccessTokenTTL = 24 * time.Hour
+	defaultReconnectTTL   = 5 * time.Minute
 )
 
 type Config struct {
 	AppEnv         string
 	HTTPAddr       string
+	RedisURL       string
 	JWTSecret      string
 	AccessTokenTTL time.Duration
+	ReconnectTTL   time.Duration
 }
 
 func LoadConfig() Config {
 	return Config{
 		AppEnv:         getenv("APP_ENV", defaultAppEnv),
 		HTTPAddr:       getenv("HTTP_ADDR", defaultHTTPAddr),
+		RedisURL:       getenv("REDIS_URL", ""),
 		JWTSecret:      getenv("JWT_SECRET", defaultJWTSecret),
 		AccessTokenTTL: getenvDuration("ACCESS_TOKEN_TTL", defaultAccessTokenTTL),
+		ReconnectTTL:   getenvDuration("RECONNECT_TTL", defaultReconnectTTL),
 	}
 }
 

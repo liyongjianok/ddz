@@ -1,10 +1,13 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
+
+	"ddz/backend/internal/profile"
 )
 
 var ErrInvalidAuthConfig = errors.New("invalid auth config")
@@ -46,15 +49,19 @@ type GuestLoginResult struct {
 	ExpiresIn   int64  `json:"expires_in"`
 }
 
-// Service 负责游客身份生成和 token 签发。
+// Service 负责游客身份生成、资料初始化和 token 签发。
 type Service struct {
-	jwt     *JWTManager
-	userSeq atomic.Uint64
+	jwt            *JWTManager
+	profileService *profile.Service
+	userSeq        atomic.Uint64
 }
 
 // NewService 创建认证服务。
-func NewService(jwt *JWTManager) *Service {
-	return &Service{jwt: jwt}
+func NewService(jwt *JWTManager, profileService *profile.Service) *Service {
+	return &Service{
+		jwt:            jwt,
+		profileService: profileService,
+	}
 }
 
 // GuestLogin 创建游客用户并签发 access token。
@@ -76,6 +83,12 @@ func (s *Service) GuestLogin(input GuestLoginInput) (GuestLoginResult, error) {
 		AccountType: AccountTypeGuest,
 	}
 
+	if s.profileService != nil {
+		if _, err := s.profileService.EnsureProfile(context.Background(), user.ID); err != nil {
+			return GuestLoginResult{}, err
+		}
+	}
+
 	token, claims, err := s.jwt.Issue(user)
 	if err != nil {
 		return GuestLoginResult{}, err
@@ -89,7 +102,7 @@ func (s *Service) GuestLogin(input GuestLoginInput) (GuestLoginResult, error) {
 }
 
 // IdentityFromClaims 根据 JWT claims 还原用户身份信息。
-func IdentityFromClaims(claims Claims) Identity {
+func IdentityFromClaims(claims Claims, userProfile Profile) Identity {
 	return Identity{
 		User: User{
 			ID:          claims.Subject,
@@ -97,11 +110,12 @@ func IdentityFromClaims(claims Claims) Identity {
 			AvatarURL:   claims.AvatarURL,
 			AccountType: claims.AccountType,
 		},
-		Profile: defaultProfile(),
+		Profile: userProfile,
 	}
 }
 
-func defaultProfile() Profile {
+// DefaultProfile 返回未持久化用户的默认资料。
+func DefaultProfile() Profile {
 	return Profile{
 		Level:       1,
 		CoinBalance: 10000,

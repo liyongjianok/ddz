@@ -800,6 +800,22 @@ func TestCompletedGameCanBeQueriedFromRecordAPI(t *testing.T) {
 	if len(detailData.Events) < 2 {
 		t.Fatalf("events len = %d, want >= 2", len(detailData.Events))
 	}
+
+	hostMe := currentUserWithToken(t, handler, hostToken)
+	if hostMe.Profile.TotalGames != 1 {
+		t.Fatalf("host total_games = %d, want 1", hostMe.Profile.TotalGames)
+	}
+	if hostMe.Profile.Wins != 1 {
+		t.Fatalf("host wins = %d, want 1", hostMe.Profile.Wins)
+	}
+
+	user2Me := currentUserWithToken(t, handler, user2Token)
+	if user2Me.Profile.TotalGames != 1 {
+		t.Fatalf("user2 total_games = %d, want 1", user2Me.Profile.TotalGames)
+	}
+	if user2Me.Profile.Wins != 0 {
+		t.Fatalf("user2 wins = %d, want 0", user2Me.Profile.Wins)
+	}
 }
 
 func createRoomViaAPI(t *testing.T, handler http.Handler, token string, payload string) roomAccessData {

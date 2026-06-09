@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"ddz/backend/internal/auth"
+	"ddz/backend/internal/profile"
 	"ddz/backend/internal/record"
 	"ddz/backend/internal/room"
 	"ddz/backend/internal/ws"
@@ -76,6 +77,7 @@ type httpApp struct {
 	authMiddleware *auth.Middleware
 	roomManager    *room.Manager
 	recordService  *record.Service
+	profileService *profile.Service
 }
 
 func NewHTTPServer(cfg Config) *http.Server {
@@ -86,24 +88,39 @@ func NewHTTPServer(cfg Config) *http.Server {
 }
 
 func NewHTTPHandler(cfg Config) http.Handler {
-	return NewHTTPHandlerWithDependencies(
+	redisStore := NewRedisStore(cfg)
+	return NewHTTPHandlerWithServices(
 		cfg,
 		room.NewManager(),
-		record.NewService(NewRecordStore(cfg, NewRedisStore(cfg))),
+		record.NewService(NewRecordStore(cfg, redisStore)),
+		profile.NewService(NewProfileStore(cfg, redisStore)),
 	)
 }
 
 // NewHTTPHandlerWithManager 创建带指定房间管理器的 HTTP Handler，便于测试和复用。
 func NewHTTPHandlerWithManager(cfg Config, roomManager *room.Manager) http.Handler {
-	return NewHTTPHandlerWithDependencies(
+	redisStore := NewRedisStore(cfg)
+	return NewHTTPHandlerWithServices(
 		cfg,
 		roomManager,
-		record.NewService(NewRecordStore(cfg, NewRedisStore(cfg))),
+		record.NewService(NewRecordStore(cfg, redisStore)),
+		profile.NewService(NewProfileStore(cfg, redisStore)),
 	)
 }
 
-// NewHTTPHandlerWithDependencies 创建带显式依赖的 HTTP Handler。
+// NewHTTPHandlerWithDependencies 兼容现有测试调用，自动补齐未显式传入的 profileService。
 func NewHTTPHandlerWithDependencies(cfg Config, roomManager *room.Manager, recordService *record.Service) http.Handler {
+	redisStore := NewRedisStore(cfg)
+	return NewHTTPHandlerWithServices(
+		cfg,
+		roomManager,
+		recordService,
+		profile.NewService(NewProfileStore(cfg, redisStore)),
+	)
+}
+
+// NewHTTPHandlerWithServices 创建带显式依赖的 HTTP Handler。
+func NewHTTPHandlerWithServices(cfg Config, roomManager *room.Manager, recordService *record.Service, profileService *profile.Service) http.Handler {
 	jwtManager, err := auth.NewJWTManager(cfg.JWTSecret, cfg.AccessTokenTTL)
 	if err != nil {
 		panic(err)
@@ -114,14 +131,18 @@ func NewHTTPHandlerWithDependencies(cfg Config, roomManager *room.Manager, recor
 	if recordService == nil {
 		recordService = record.NewService(NewRecordStore(cfg, NewRedisStore(cfg)))
 	}
+	if profileService == nil {
+		profileService = profile.NewService(NewProfileStore(cfg, NewRedisStore(cfg)))
+	}
 
 	app := &httpApp{
-		authService:    auth.NewService(jwtManager),
+		authService:    auth.NewService(jwtManager, profileService),
 		authMiddleware: auth.NewMiddleware(jwtManager),
 		roomManager:    roomManager,
 		recordService:  recordService,
+		profileService: profileService,
 	}
-	wsGateway := ws.NewGateway(jwtManager, roomManager, recordService)
+	wsGateway := ws.NewGateway(jwtManager, roomManager, recordService, profileService)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
@@ -182,7 +203,22 @@ func (a *httpApp) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	identity := auth.IdentityFromClaims(claims)
+	userProfile := auth.DefaultProfile()
+	if a.profileService != nil {
+		p, err := a.profileService.GetProfile(r.Context(), claims.Subject)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "internal_error", "internal error")
+			return
+		}
+		userProfile = auth.Profile{
+			Level:       p.Level,
+			CoinBalance: p.CoinBalance,
+			TotalGames:  p.TotalGames,
+			Wins:        p.Wins,
+		}
+	}
+
+	identity := auth.IdentityFromClaims(claims, userProfile)
 	writeJSON(w, http.StatusOK, apiResponse{
 		Code:    "ok",
 		Message: "ok",

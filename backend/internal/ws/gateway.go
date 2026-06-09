@@ -14,6 +14,7 @@ import (
 
 	"ddz/backend/internal/auth"
 	"ddz/backend/internal/game"
+	"ddz/backend/internal/profile"
 	"ddz/backend/internal/record"
 	"ddz/backend/internal/room"
 
@@ -151,6 +152,7 @@ type Gateway struct {
 	jwt         *auth.JWTManager
 	roomManager *room.Manager
 	recordSvc   *record.Service
+	profileSvc  *profile.Service
 	upgrader    websocket.Upgrader
 	now         func() time.Time
 
@@ -172,11 +174,12 @@ type clientConn struct {
 }
 
 // NewGateway 创建房间 WebSocket 网关。
-func NewGateway(jwt *auth.JWTManager, roomManager *room.Manager, recordSvc *record.Service) *Gateway {
+func NewGateway(jwt *auth.JWTManager, roomManager *room.Manager, recordSvc *record.Service, profileSvc *profile.Service) *Gateway {
 	return &Gateway{
 		jwt:         jwt,
 		roomManager: roomManager,
 		recordSvc:   recordSvc,
+		profileSvc:  profileSvc,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool {
 				return true
@@ -835,11 +838,16 @@ func (g *Gateway) appendPassEvent(currentRoom *room.Room, actorUserID string, se
 }
 
 func (g *Gateway) finalizeGameRecord(currentRoom *room.Room) {
-	if g.recordSvc == nil || currentRoom == nil || currentRoom.CurrentGame == nil || currentRoom.CurrentGame.Settlement == nil {
+	if currentRoom == nil || currentRoom.CurrentGame == nil || currentRoom.CurrentGame.Settlement == nil {
 		return
 	}
-	_ = g.recordSvc.AppendEvent(context.Background(), record.BuildEventFromSettlement(currentRoom))
-	_ = g.recordSvc.SaveGameRecord(context.Background(), currentRoom)
+	if g.recordSvc != nil {
+		_ = g.recordSvc.AppendEvent(context.Background(), record.BuildEventFromSettlement(currentRoom))
+		_ = g.recordSvc.SaveGameRecord(context.Background(), currentRoom)
+	}
+	if g.profileSvc != nil {
+		_ = g.profileSvc.ApplySettlementFromRoom(context.Background(), currentRoom)
+	}
 }
 
 func (g *Gateway) persistAutoAction(beforeRoom *room.Room, currentRoom *room.Room, action room.TimeoutAction) {

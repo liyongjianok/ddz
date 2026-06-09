@@ -1,23 +1,8 @@
 # DDZ Web Game
 
-网页版斗地主项目。当前仓库按 `docs/zh/08-task-backlog.md` 进行分 Sprint、分模块开发。
+网页版斗地主项目。
 
-## 当前阶段
-
-已完成：
-
-- `T-0001 创建仓库结构`
-- `T-0002 后端配置和服务骨架`
-
-未实现：
-
-- 认证。
-- 游戏规则。
-- 房间。
-- WebSocket。
-- 前端业务页面。
-
-以上内容属于后续任务，不应在 `T-0001` 中实现。
+当前仓库按 `docs/zh/08-task-backlog.md` 逐任务推进，已完成核心后端、WebSocket、前端 MVP、战绩持久化和玩家统计等阶段性能力。
 
 ## 目录结构
 
@@ -26,10 +11,10 @@
 ├── backend/   # Go 后端
 ├── frontend/  # Vite React TypeScript 前端
 ├── deploy/    # 部署配置
-└── docs/      # 研发文档
+└── docs/      # 中英文研发文档
 ```
 
-## 后端命令
+## 后端
 
 ```bash
 cd backend
@@ -37,11 +22,7 @@ go test ./...
 go run ./cmd/server
 ```
 
-默认监听地址为 `:8080`。可以通过环境变量覆盖：
-
-```bash
-APP_ENV=dev HTTP_ADDR=:18080 go run ./cmd/server
-```
+默认监听 `:8080`。
 
 健康检查：
 
@@ -49,7 +30,7 @@ APP_ENV=dev HTTP_ADDR=:18080 go run ./cmd/server
 curl http://localhost:8080/healthz
 ```
 
-## 前端命令
+## 前端
 
 建议使用 Node.js 18+。
 
@@ -60,11 +41,29 @@ npm run dev
 npm run build
 ```
 
-当前前端仅为 Vite React TypeScript 脚手架。登录、大厅和房间 UI 将在后续任务实现。
+开发模式默认地址：
 
-## AI 开发约束
+- 前端：http://localhost:5173
+- 后端：http://localhost:8080
 
-每次只执行一个 backlog 任务。开始任何任务前先阅读：
+## Docker Compose
+
+可以一条命令启动前端、后端、PostgreSQL 和 Redis：
+
+```bash
+docker compose -f deploy/docker-compose.dev.yml up --build
+```
+
+启动后默认地址：
+
+- 前端：http://localhost:5173
+- 后端健康检查：http://localhost:8080/healthz
+- PostgreSQL：`localhost:5432`
+- Redis：`localhost:6379`
+
+## 开发约束
+
+开始任何任务前，先阅读：
 
 - `docs/zh/07-ai-coding-rules.md`
 - `docs/zh/08-task-backlog.md`

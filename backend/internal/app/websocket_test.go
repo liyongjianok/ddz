@@ -654,6 +654,50 @@ func TestRoomWebSocketDisconnectMarksPlayerOffline(t *testing.T) {
 	}
 }
 
+func TestRoomWebSocketReconnectRestoresPrivateSnapshotAndOnlineStatus(t *testing.T) {
+	setup := newThreePlayerRoom(t)
+	readyAllPlayers(t, setup)
+	if _, err := setup.Manager.Bid(room.BidInput{
+		RoomID: setup.RoomID,
+		UserID: setup.Host.ID,
+		Score:  3,
+	}); err != nil {
+		t.Fatalf("Bid() error = %v", err)
+	}
+
+	server := httptest.NewServer(setup.Handler)
+	defer server.Close()
+
+	hostConn, _ := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.Host.Token)
+	defer hostConn.Close()
+	user2Conn, firstSnapshot := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User2.Token)
+
+	if len(firstSnapshot.Me.Hand) == 0 {
+		t.Fatal("initial hand should not be empty")
+	}
+
+	if err := user2Conn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	waitForPlayerStatusSnapshot(t, hostConn, setup.User2.ID, "offline")
+
+	reconnectConn, reconnectSnapshot := connectRoomWebSocket(t, server.URL, setup.RoomID, setup.User2.Token)
+	defer reconnectConn.Close()
+
+	if findPlayerStatus(reconnectSnapshot.Players, setup.User2.ID) != "playing" {
+		t.Fatalf("reconnect status = %q, want %q", findPlayerStatus(reconnectSnapshot.Players, setup.User2.ID), "playing")
+	}
+	if len(reconnectSnapshot.Me.Hand) == 0 {
+		t.Fatal("reconnect hand should not be empty")
+	}
+	if len(reconnectSnapshot.Me.Hand) != len(firstSnapshot.Me.Hand) {
+		t.Fatalf("reconnect hand len = %d, want %d", len(reconnectSnapshot.Me.Hand), len(firstSnapshot.Me.Hand))
+	}
+
+	waitForPlayerStatusSnapshot(t, hostConn, setup.User2.ID, "playing")
+}
+
 func createRoomViaAPI(t *testing.T, handler http.Handler, token string, payload string) roomAccessData {
 	t.Helper()
 
@@ -1005,4 +1049,28 @@ func findPlayerStatus(players []room.RoomSnapshotPlayer, userID string) string {
 		}
 	}
 	return ""
+}
+
+func waitForPlayerStatusSnapshot(t *testing.T, conn *websocket.Conn, userID string, wantStatus string) room.RoomSnapshot {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("did not receive %q snapshot in time", wantStatus)
+		}
+
+		envelope := readWSEnvelope(t, conn)
+		if envelope.Type != "room.snapshot" {
+			continue
+		}
+
+		var snapshot room.RoomSnapshot
+		if err := json.Unmarshal(envelope.Payload, &snapshot); err != nil {
+			t.Fatalf("unmarshal snapshot: %v", err)
+		}
+		if findPlayerStatus(snapshot.Players, userID) == wantStatus {
+			return snapshot
+		}
+	}
 }

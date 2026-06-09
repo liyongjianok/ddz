@@ -156,13 +156,14 @@ type Gateway struct {
 }
 
 type clientConn struct {
-	gateway *Gateway
-	roomID  string
-	userID  string
-	conn    *websocket.Conn
-	send    chan []byte
-	done    chan struct{}
-	seq     atomic.Uint64
+	gateway    *Gateway
+	roomID     string
+	userID     string
+	wasOffline bool
+	conn       *websocket.Conn
+	send       chan []byte
+	done       chan struct{}
+	seq        atomic.Uint64
 
 	closeOnce sync.Once
 }
@@ -213,6 +214,21 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	preSnapshot, err := g.roomManager.GetRoomSnapshot(roomID, claims.Subject)
+	if err != nil {
+		statusCode, code, message := mapRoomError(err)
+		writeError(w, r, statusCode, code, message)
+		return
+	}
+
+	wasOffline := snapshotPlayerStatus(preSnapshot.Players, claims.Subject) == string(game.PlayerStatusOffline)
+
+	if _, err := g.roomManager.SetPlayerOnline(roomID, claims.Subject, true); err != nil {
+		statusCode, code, message := mapRoomError(err)
+		writeError(w, r, statusCode, code, message)
+		return
+	}
+
 	snapshot, err := g.roomManager.GetRoomSnapshot(roomID, claims.Subject)
 	if err != nil {
 		statusCode, code, message := mapRoomError(err)
@@ -226,12 +242,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &clientConn{
-		gateway: g,
-		roomID:  roomID,
-		userID:  claims.Subject,
-		conn:    conn,
-		send:    make(chan []byte, defaultSendBufferSize),
-		done:    make(chan struct{}),
+		gateway:    g,
+		roomID:     roomID,
+		userID:     claims.Subject,
+		wasOffline: wasOffline,
+		conn:       conn,
+		send:       make(chan []byte, defaultSendBufferSize),
+		done:       make(chan struct{}),
 	}
 
 	g.register(client)
@@ -246,8 +263,6 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) register(client *clientConn) {
-	alreadyConnected := false
-
 	g.mu.Lock()
 	roomClients := g.rooms[client.roomID]
 	if roomClients == nil {
@@ -255,9 +270,6 @@ func (g *Gateway) register(client *clientConn) {
 		g.rooms[client.roomID] = roomClients
 	}
 	previous := roomClients[client.userID]
-	if previous != nil {
-		alreadyConnected = true
-	}
 	roomClients[client.userID] = client
 	g.mu.Unlock()
 
@@ -265,28 +277,9 @@ func (g *Gateway) register(client *clientConn) {
 		previous.close()
 	}
 
-	if alreadyConnected {
-		if _, err := g.roomManager.SetPlayerOnline(client.roomID, client.userID, true); err == nil {
-			g.broadcastRoomSnapshots(client.roomID)
-		}
-		return
+	if client.wasOffline {
+		g.broadcastRoomSnapshots(client.roomID)
 	}
-
-	if _, err := g.roomManager.SetPlayerOnline(client.roomID, client.userID, true); err == nil {
-		roomSnapshot, snapshotErr := g.roomManager.GetRoomSnapshot(client.roomID, client.userID)
-		if snapshotErr == nil && roomSnapshot != nil && hasOfflinePlayer(roomSnapshot.Players) {
-			g.broadcastRoomSnapshots(client.roomID)
-		}
-	}
-}
-
-func hasOfflinePlayer(players []room.RoomSnapshotPlayer) bool {
-	for _, player := range players {
-		if player.Status == string(game.PlayerStatusOffline) {
-			return true
-		}
-	}
-	return false
 }
 
 func (g *Gateway) unregister(client *clientConn) {
@@ -878,6 +871,15 @@ func findRemainingCountByUserID(players []game.PlayerState, userID string) (int,
 		}
 	}
 	return 0, false
+}
+
+func snapshotPlayerStatus(players []room.RoomSnapshotPlayer, userID string) string {
+	for _, player := range players {
+		if player.UserID == userID {
+			return player.Status
+		}
+	}
+	return ""
 }
 
 func decodeJSON(raw []byte, target any) error {

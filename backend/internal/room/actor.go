@@ -464,7 +464,11 @@ func (a *RoomActor) applyAutoAction(seatIndex int) (Room, TimeoutAction, error) 
 	currentGame := a.room.CurrentGame
 	switch currentGame.Phase {
 	case game.GamePhaseBidding:
-		if err := currentGame.PlaceBid(seatIndex, 0, a.rng); err != nil {
+		score := 0
+		if currentGame.Players[seatIndex].IsRobot {
+			score = chooseRobotBid(currentGame, seatIndex)
+		}
+		if err := currentGame.PlaceBid(seatIndex, score, a.rng); err != nil {
 			return Room{}, TimeoutActionNone, err
 		}
 		if err := a.syncRoomGameState(); err != nil {
@@ -472,7 +476,36 @@ func (a *RoomActor) applyAutoAction(seatIndex int) (Room, TimeoutAction, error) 
 		}
 		return a.room.Snapshot(), TimeoutActionAutoBid, nil
 	case game.GamePhasePlaying:
-		if currentGame.LastPlay != nil {
+		if !currentGame.Players[seatIndex].IsRobot {
+			if currentGame.LastPlay != nil {
+				if err := currentGame.Pass(seatIndex); err != nil {
+					return Room{}, TimeoutActionNone, err
+				}
+				if err := a.syncRoomGameState(); err != nil {
+					return Room{}, TimeoutActionNone, err
+				}
+				return a.room.Snapshot(), TimeoutActionAutoPass, nil
+			}
+
+			player := currentGame.Players[seatIndex]
+			moves := game.LegalMoves(player.Hand, nil)
+			if len(moves) == 0 {
+				return Room{}, TimeoutActionNone, game.ErrInvalidCardSet
+			}
+			if err := currentGame.PlayCards(seatIndex, moves[0].Cards); err != nil {
+				return Room{}, TimeoutActionNone, err
+			}
+			if err := a.syncRoomGameState(); err != nil {
+				return Room{}, TimeoutActionNone, err
+			}
+			return a.room.Snapshot(), TimeoutActionAutoPlay, nil
+		}
+
+		choice := chooseRobotPlay(currentGame, seatIndex)
+		if choice.pass {
+			if currentGame.LastPlay == nil {
+				return Room{}, TimeoutActionNone, game.ErrInvalidCardSet
+			}
 			if err := currentGame.Pass(seatIndex); err != nil {
 				return Room{}, TimeoutActionNone, err
 			}
@@ -482,12 +515,10 @@ func (a *RoomActor) applyAutoAction(seatIndex int) (Room, TimeoutAction, error) 
 			return a.room.Snapshot(), TimeoutActionAutoPass, nil
 		}
 
-		player := currentGame.Players[seatIndex]
-		moves := game.LegalMoves(player.Hand, nil)
-		if len(moves) == 0 {
+		if len(choice.cards) == 0 {
 			return Room{}, TimeoutActionNone, game.ErrInvalidCardSet
 		}
-		if err := currentGame.PlayCards(seatIndex, moves[0].Cards); err != nil {
+		if err := currentGame.PlayCards(seatIndex, choice.cards); err != nil {
 			return Room{}, TimeoutActionNone, err
 		}
 		if err := a.syncRoomGameState(); err != nil {

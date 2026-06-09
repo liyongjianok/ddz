@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useAuth } from "../../auth/AuthContext";
+import {
+  canPlaySelection,
+  describeSelection,
+  findHintCards,
+  sortCards,
+  type SortMode,
+} from "../../room/cardRules";
 import { useRoom } from "../../room/RoomContext";
 import type { RoomSnapshotPlay, RoomSnapshotPlayer } from "../../types/api";
 import { AppLayout } from "../layout/AppLayout";
@@ -14,6 +21,7 @@ export function RoomPage() {
   const { roomID = "" } = useParams();
   const auth = useAuth();
   const room = useRoom();
+  const [sortMode, setSortMode] = useState<SortMode>("rank");
 
   useEffect(() => {
     if (!roomID || !auth.accessToken) {
@@ -50,8 +58,27 @@ export function RoomPage() {
   const lastPlaySeatIndex = room.game?.last_play?.seat_index ?? -1;
   const canPass = room.game?.phase === "playing" && Boolean(room.game.last_play) && lastPlaySeatIndex !== mySeat;
   const myPlayer = room.players.find((player) => player.seat_index === mySeat);
-  const selectedHand = room.me?.hand ?? [];
+  const selectedHand = useMemo(() => sortCards(room.me?.hand ?? [], sortMode), [room.me?.hand, sortMode]);
+  const canPlaySelected = useMemo(
+    () => canPlaySelection(room.selectedCards, room.game?.last_play, mySeat),
+    [mySeat, room.game?.last_play, room.selectedCards],
+  );
+  const selectionHint = useMemo(
+    () => describeSelection(room.selectedCards, room.game?.last_play, mySeat),
+    [mySeat, room.game?.last_play, room.selectedCards],
+  );
+  const hintCards = useMemo(
+    () => findHintCards(selectedHand, room.game?.last_play, mySeat),
+    [mySeat, room.game?.last_play, selectedHand],
+  );
   const deadlineText = formatDeadline(room.game?.deadline_at, now);
+
+  function handleHint() {
+    if (!hintCards.length) {
+      return;
+    }
+    room.selectCards(hintCards);
+  }
 
   return (
     <AppLayout>
@@ -133,7 +160,25 @@ export function RoomPage() {
           <section className="workspace-panel workspace-panel--full my-hand-panel">
             <div className="panel-heading">
               <h2>我的手牌</h2>
-              <span className="panel-hint">{selectedHand.length} 张</span>
+              <div className="hand-toolbar">
+                <div className="filter-group" role="tablist" aria-label="手牌排序">
+                  <button
+                    className={`filter-chip${sortMode === "rank" ? " is-active" : ""}`}
+                    type="button"
+                    onClick={() => setSortMode("rank")}
+                  >
+                    按点数
+                  </button>
+                  <button
+                    className={`filter-chip${sortMode === "suit" ? " is-active" : ""}`}
+                    type="button"
+                    onClick={() => setSortMode("suit")}
+                  >
+                    按花色
+                  </button>
+                </div>
+                <span className="panel-hint">{selectedHand.length} 张</span>
+              </div>
             </div>
             <HandCards
               cards={selectedHand}
@@ -148,12 +193,16 @@ export function RoomPage() {
             isMyTurn={isMyTurn}
             canPass={canPass}
             selectedCount={room.selectedCards.length}
+            canPlaySelected={canPlaySelected}
+            selectionHint={selectionHint}
+            canHint={hintCards.length > 0}
             isWaitingRoom={isWaitingRoom}
             isReady={Boolean(myPlayer?.ready)}
             onReady={() => room.sendReady(true)}
             onBid={room.sendBid}
             onPlay={room.sendPlay}
             onPass={room.sendPass}
+            onHint={handleHint}
             onClear={room.clearSelection}
           />
 

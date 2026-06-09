@@ -3,12 +3,16 @@ interface ActionPanelProps {
   isMyTurn: boolean;
   canPass: boolean;
   selectedCount: number;
+  canPlaySelected: boolean;
+  selectionHint: string;
+  canHint: boolean;
   isWaitingRoom: boolean;
   isReady: boolean;
   onReady: () => void;
   onBid: (score: 0 | 1 | 2 | 3) => void;
   onPlay: () => void;
   onPass: () => void;
+  onHint: () => void;
   onClear: () => void;
 }
 
@@ -17,12 +21,16 @@ export function ActionPanel({
   isMyTurn,
   canPass,
   selectedCount,
+  canPlaySelected,
+  selectionHint,
+  canHint,
   isWaitingRoom,
   isReady,
   onReady,
   onBid,
   onPlay,
   onPass,
+  onHint,
   onClear,
 }: ActionPanelProps) {
   if (isWaitingRoom) {
@@ -70,18 +78,21 @@ export function ActionPanel({
       <section className="action-panel">
         <div className="action-panel__header">
           <h2>出牌阶段</h2>
-          <span className="panel-hint">
-            {isMyTurn ? `已选 ${selectedCount} 张牌` : "等待当前玩家操作"}
+          <span className={`panel-hint${isMyTurn && selectedCount > 0 && !canPlaySelected ? " is-warning" : ""}`}>
+            {isMyTurn ? selectionHint : "等待当前玩家操作"}
           </span>
         </div>
         <div className="action-row">
           <button className="secondary-button" type="button" onClick={onClear} disabled={selectedCount === 0}>
             清空选择
           </button>
+          <button className="secondary-button" type="button" onClick={onHint} disabled={!isMyTurn || !canHint}>
+            提示
+          </button>
           <button className="secondary-button" type="button" onClick={onPass} disabled={!isMyTurn || !canPass}>
             不出
           </button>
-          <button className="primary-button" type="button" onClick={onPlay} disabled={!isMyTurn || selectedCount === 0}>
+          <button className="primary-button" type="button" onClick={onPlay} disabled={!isMyTurn || !canPlaySelected}>
             出选中牌
           </button>
         </div>

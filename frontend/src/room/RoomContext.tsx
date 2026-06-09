@@ -38,6 +38,7 @@ interface RoomContextValue {
   connectRoom: (roomID: string) => void;
   disconnectRoom: () => void;
   toggleCard: (card: string) => void;
+  selectCards: (cards: string[]) => void;
   clearSelection: () => void;
   sendReady: (ready: boolean) => void;
   sendBid: (score: 0 | 1 | 2 | 3) => void;
@@ -336,6 +337,10 @@ export function RoomProvider({ children }: PropsWithChildren) {
     });
   }, []);
 
+  const selectCards = useCallback((cards: string[]) => {
+    setSelectedCards(cards);
+  }, []);
+
   const clearSelection = useCallback(() => {
     setSelectedCards([]);
   }, []);
@@ -373,6 +378,7 @@ export function RoomProvider({ children }: PropsWithChildren) {
       connectRoom,
       disconnectRoom,
       toggleCard,
+      selectCards,
       clearSelection,
       sendReady,
       sendBid,
@@ -392,6 +398,7 @@ export function RoomProvider({ children }: PropsWithChildren) {
       sendPlay,
       sendReady,
       snapshot,
+      selectCards,
       toggleCard,
     ],
   );
